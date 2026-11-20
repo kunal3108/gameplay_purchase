@@ -33,9 +33,16 @@ export function buildPlayerStatusResponse(state: GameStateSnapshot): object {
 /**
  * Build the LlmTool array for the agent config.
  * @param toolBaseUrl - Publicly accessible base URL (required for Agora cloud to reach).
- * @param channel - Session channel name (injected as template_variables.channel).
+ * @param secret - TOOL_SECRET value; sent as a constant Authorization header so it
+ *   never appears in access-log URLs or server-side request logs.
  */
-export function buildTools(toolBaseUrl: string): LlmTool[] {
+export function buildTools(toolBaseUrl: string, secret: string): LlmTool[] {
+  // Constant header value — LlmToolServer.headers supports constants and
+  // {{template_variables.*}} placeholders. Secret stays out of the URL.
+  const authHeaders: Record<string, string> = {
+    Authorization: `Bearer ${secret}`,
+  };
+
   return [
     {
       type: 'function',
@@ -51,6 +58,7 @@ export function buildTools(toolBaseUrl: string): LlmTool[] {
       server: {
         method: 'GET',
         url: `${toolBaseUrl}/api/tools/list_available_weapons?channel={{template_variables.channel}}`,
+        headers: authHeaders,
         timeout_ms: 5000,
       },
     },
@@ -68,6 +76,7 @@ export function buildTools(toolBaseUrl: string): LlmTool[] {
       server: {
         method: 'GET',
         url: `${toolBaseUrl}/api/tools/get_player_status?channel={{template_variables.channel}}`,
+        headers: authHeaders,
         timeout_ms: 5000,
       },
     },

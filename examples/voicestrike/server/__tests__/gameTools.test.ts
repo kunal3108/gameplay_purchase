@@ -82,33 +82,45 @@ describe('buildPlayerStatusResponse', () => {
 });
 
 describe('buildTools', () => {
+  const SECRET = 'test-secret-abc123';
+
   it('returns two tools', () => {
-    const tools = buildTools('https://example.com');
+    const tools = buildTools('https://example.com', SECRET);
     expect(tools).toHaveLength(2);
   });
 
   it('tool names are correct', () => {
-    const tools = buildTools('https://example.com');
+    const tools = buildTools('https://example.com', SECRET);
     expect(tools[0]!.function.name).toBe('list_available_weapons');
     expect(tools[1]!.function.name).toBe('get_player_status');
   });
 
-  it('tool URLs contain the base URL and channel template variable', () => {
-    const tools = buildTools('https://my-tunnel.example.com');
-    expect(tools[0]!.server.url).toContain('https://my-tunnel.example.com');
-    expect(tools[0]!.server.url).toContain('{{template_variables.channel}}');
-    expect(tools[1]!.server.url).toContain('{{template_variables.channel}}');
+  it('tool URLs contain the base URL and channel template variable but NOT the secret', () => {
+    const tools = buildTools('https://my-tunnel.example.com', SECRET);
+    for (const tool of tools) {
+      expect(tool.server.url).toContain('https://my-tunnel.example.com');
+      expect(tool.server.url).toContain('{{template_variables.channel}}');
+      // Secret must not appear in the URL — it belongs in the Authorization header only
+      expect(tool.server.url).not.toContain(SECRET);
+    }
+  });
+
+  it('tool headers include Authorization: Bearer <secret>', () => {
+    const tools = buildTools('https://example.com', SECRET);
+    for (const tool of tools) {
+      expect(tool.server.headers?.['Authorization']).toBe(`Bearer ${SECRET}`);
+    }
   });
 
   it('all tools use sync execution mode', () => {
-    const tools = buildTools('https://example.com');
+    const tools = buildTools('https://example.com', SECRET);
     for (const tool of tools) {
       expect(tool.execution?.mode).toBe('sync');
     }
   });
 
   it('timeout is set within Agora allowed range (1000–100000ms)', () => {
-    const tools = buildTools('https://example.com');
+    const tools = buildTools('https://example.com', SECRET);
     for (const tool of tools) {
       const ms = tool.server.timeout_ms as number;
       expect(ms).toBeGreaterThanOrEqual(1000);

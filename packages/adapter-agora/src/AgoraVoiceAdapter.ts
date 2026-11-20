@@ -46,6 +46,9 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
   // Mic mute state
   private micMuted = false;
 
+  // Write token for authorised session-state pushes
+  private writeToken: string | null = null;
+
   constructor(config: AgoraVoiceConfig, callbacks: AgoraVoiceCallbacks = {}) {
     this.appId = config.appId;
     this.serverUrl = config.serverUrl ?? 'http://localhost:3001';
@@ -90,9 +93,10 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
       const channelParam = preferredChannel ? `&channel=${encodeURIComponent(preferredChannel)}` : '';
       const tokenRes = await fetch(`${this.serverUrl}/api/generate-agora-token?uid=0${channelParam}`);
       if (!tokenRes.ok) throw new Error(`Token fetch failed: ${tokenRes.status}`);
-      const { token, uid, channel } = await tokenRes.json() as { token: string; uid: string; channel: string };
+      const { token, uid, channel, writeToken } = await tokenRes.json() as { token: string; uid: string; channel: string; writeToken?: string };
       this.uid = uid;
       this.channel = channel;
+      this.writeToken = writeToken ?? null;
 
       // 2. Create microphone track — catch permission denial
       try {
@@ -254,6 +258,7 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
 
     this.uid = null;
     this.channel = null;
+    this.writeToken = null;
   }
 
   private readonly handleUnload = (): void => {
@@ -272,10 +277,14 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
    * Fire-and-forget — never throws.
    */
   pushGameState(state: GameStateSnapshot): void {
-    if (!this.channel) return; // not yet joined a channel
+    if (!this.channel || !this.writeToken) return; // not yet joined or no write token
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Write-Token': this.writeToken,
+    };
     fetch(`${this.serverUrl}/api/session-state`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ channel: this.channel, state }),
     }).catch(() => {}); // best-effort, non-fatal
   }

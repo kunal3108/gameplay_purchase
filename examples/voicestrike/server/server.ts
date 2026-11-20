@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import agoraToken from 'agora-token';
@@ -11,6 +12,21 @@ import type { GameStateSnapshot } from './sessionStore.js';
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3001;
 const TOOL_BASE_URL = process.env.TOOL_BASE_URL?.replace(/\/$/, ''); // strip trailing slash
+
+// ─── TOOL_SECRET: authorises Agora cloud → tool endpoint calls ───────────────
+// Embedded server-side in tool URLs; never sent to the browser.
+// Auto-generated (ephemeral) if not set — add to server/.env for stability.
+let TOOL_SECRET = process.env.TOOL_SECRET ?? '';
+if (!TOOL_SECRET) {
+  TOOL_SECRET = randomUUID().replace(/-/g, '');
+  console.warn(`[auth] TOOL_SECRET not set — using ephemeral value for this process.`);
+  console.warn(`[auth] Add TOOL_SECRET=${TOOL_SECRET} to server/.env to persist across restarts.`);
+}
+
+// ─── Write-token store: authorises browser → session-state pushes ────────────
+// Each channel gets a unique token at token-generation time.
+// The browser must include it as X-Write-Token on every /api/session-state POST.
+const writeTokenStore = new Map<string, string>();
 
 // Accept both JSON and plain-text bodies (sendBeacon sends text/plain)
 app.use(cors());
@@ -84,7 +100,11 @@ app.get('/api/generate-agora-token', (req, res) => {
       expiresAt,
     );
 
-    res.json({ token, uid: uid.toString(), channel });
+    // Issue a write token scoped to this channel; returned to browser only.
+    const writeToken = randomUUID();
+    writeTokenStore.set(channel, writeToken);
+
+    res.json({ token, uid: uid.toString(), channel, writeToken });
   } catch (err) {
     console.error('Token error:', err);
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -101,6 +121,15 @@ app.post('/api/session-state', (req, res) => {
       res.status(400).json({ error: 'channel and state are required' });
       return;
     }
+
+    // Validate write token — must match the token issued for this exact channel.
+    const providedToken = req.headers['x-write-token'];
+    const expectedToken = writeTokenStore.get(channel);
+    if (!providedToken || !expectedToken || providedToken !== expectedToken) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
     sessionStore.set(channel, state);
     res.json({ ok: true });
   } catch (err) {
@@ -110,7 +139,23 @@ app.post('/api/session-state', (req, res) => {
 
 // ─── Game context tool endpoints (called by Agora cloud) ─────────────────────
 
+/**
+ * Shared guard for tool endpoints — validates Authorization: Bearer <TOOL_SECRET>.
+ * Secret travels in an HTTP header, not in the URL, so it is omitted from
+ * access logs and never appears in proxy/CDN request-log URLs.
+ */
+function requireToolAuth(req: express.Request, res: express.Response): boolean {
+  const authHeader = req.headers['authorization'];
+  const expected = `Bearer ${TOOL_SECRET}`;
+  if (!authHeader || authHeader !== expected) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
 app.get('/api/tools/list_available_weapons', (req, res) => {
+  if (!requireToolAuth(req, res)) return;
   const channel = req.query['channel'] as string | undefined;
   if (!channel) {
     res.status(400).json({ error: 'channel query parameter is required' });
@@ -125,6 +170,7 @@ app.get('/api/tools/list_available_weapons', (req, res) => {
 });
 
 app.get('/api/tools/get_player_status', (req, res) => {
+  if (!requireToolAuth(req, res)) return;
   const channel = req.query['channel'] as string | undefined;
   if (!channel) {
     res.status(400).json({ error: 'channel query parameter is required' });
@@ -165,7 +211,7 @@ app.post('/api/invite-agent', async (req, res) => {
     const client = new AgoraClient({ area: Area.US, appId, appCertificate });
 
     // Build tools when TOOL_BASE_URL is configured (requires public URL for Agora cloud)
-    const tools = TOOL_BASE_URL ? buildTools(TOOL_BASE_URL) : [];
+    const tools = TOOL_BASE_URL ? buildTools(TOOL_BASE_URL, TOOL_SECRET) : [];
     const templateVariables = TOOL_BASE_URL ? { channel: channel_name } : {};
 
     const agent = new Agent({
@@ -247,9 +293,10 @@ app.post('/api/stop-conversation', async (req, res) => {
       return;
     }
 
-    // Clean up session state if channel was provided
+    // Clean up session and write-token state if channel was provided
     if (channel) {
       sessionStore.delete(channel);
+      writeTokenStore.delete(channel);
     }
 
     const appId = requireEnv('AGORA_APP_ID');
