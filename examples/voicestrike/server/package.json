@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node --loader ts-node/esm server.ts",
     "start": "node dist/server.js",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "vitest run"
   },
   "dependencies": {
     "agora-agents": "latest",
@@ -20,6 +21,7 @@
     "@types/express": "^4.17.21",
     "@types/node": "^20.0.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.0"
   }
 }

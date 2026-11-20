@@ -34,3 +34,16 @@ export interface AgoraVoiceCallbacks {
   onTranscript?: (entry: TranscriptEntry) => void;
   onError?: (message: string) => void;
 }
+
+/**
+ * Live game state snapshot pushed from the browser to the backend.
+ * The backend stores this per-channel so Agora's REST tool calls can read it.
+ */
+export interface GameStateSnapshot {
+  balance: number;
+  ownedWeapons: string[];
+  equippedWeapon: string;
+  health: number;
+  maxHealth: number;
+  wave: number;
+}

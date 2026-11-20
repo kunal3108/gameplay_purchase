@@ -42,6 +42,18 @@ export class GameScene extends Phaser.Scene {
     return this._currentWeaponId;
   }
 
+  get playerHealth(): number {
+    return this.player ? this.player.health : 0;
+  }
+
+  get playerMaxHealth(): number {
+    return this.player ? this.player.maxHealth : 100;
+  }
+
+  get currentWave(): number {
+    return this.waveManager ? this.waveManager.currentWave : 0;
+  }
+
   preload(): void {
     this.generateTextures();
   }

@@ -4,9 +4,13 @@ import cors from 'cors';
 import agoraToken from 'agora-token';
 const { RtcTokenBuilder, RtcRole } = agoraToken;
 import { AgoraClient, Agent, Area, DeepgramSTT, ExpiresIn, MurfTTS, OpenAI } from 'agora-agents';
+import { sessionStore } from './sessionStore.js';
+import { buildTools, buildListWeaponsResponse, buildPlayerStatusResponse } from './gameTools.js';
+import type { GameStateSnapshot } from './sessionStore.js';
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3001;
+const TOOL_BASE_URL = process.env.TOOL_BASE_URL?.replace(/\/$/, ''); // strip trailing slash
 
 // Accept both JSON and plain-text bodies (sendBeacon sends text/plain)
 app.use(cors());
@@ -27,8 +31,15 @@ const STRIKER_PROMPT = `You are **Striker**, a tactical AI co-pilot embedded in 
 You are the player's voice-controlled mission control. You can:
 - Comment on the battle as it unfolds
 - Give tactical tips (aim, movement, enemy patterns)
-- Track coins and suggest when to visit the shop
-- Celebrate kills and close calls
+- Report live game stats using your tools
+- Help the player decide when to visit the shop
+
+# Tools — Always call before answering
+You have two tools that give you live data directly from the game engine:
+- **list_available_weapons** — call this BEFORE answering ANY question about weapons, their prices, or what the player can buy. Never state prices from memory.
+- **get_player_status** — call this BEFORE answering ANY question about health, coins, wave number, or current weapon. Never guess these values.
+
+If a tool call fails or returns an error, say: "Signal lost — data unavailable, Pilot."
 
 # Tone
 - Brief, punchy, battle-ready. Max 1–2 sentences per reply.
@@ -80,22 +91,82 @@ app.get('/api/generate-agora-token', (req, res) => {
   }
 });
 
+// ─── Session state push (browser → backend) ──────────────────────────────────
+
+app.post('/api/session-state', (req, res) => {
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { channel, state } = body as { channel: string; state: GameStateSnapshot };
+    if (!channel || !state) {
+      res.status(400).json({ error: 'channel and state are required' });
+      return;
+    }
+    sessionStore.set(channel, state);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: 'Invalid request body' });
+  }
+});
+
+// ─── Game context tool endpoints (called by Agora cloud) ─────────────────────
+
+app.get('/api/tools/list_available_weapons', (req, res) => {
+  const channel = req.query['channel'] as string | undefined;
+  if (!channel) {
+    res.status(400).json({ error: 'channel query parameter is required' });
+    return;
+  }
+  const state = sessionStore.get(channel);
+  if (!state) {
+    res.status(404).json({ error: 'Session not found or expired. Game state not yet available.' });
+    return;
+  }
+  res.json(buildListWeaponsResponse(state));
+});
+
+app.get('/api/tools/get_player_status', (req, res) => {
+  const channel = req.query['channel'] as string | undefined;
+  if (!channel) {
+    res.status(400).json({ error: 'channel query parameter is required' });
+    return;
+  }
+  const state = sessionStore.get(channel);
+  if (!state) {
+    res.status(404).json({ error: 'Session not found or expired. Game state not yet available.' });
+    return;
+  }
+  res.json(buildPlayerStatusResponse(state));
+});
+
 // ─── Agent invite endpoint ────────────────────────────────────────────────────
 
 app.post('/api/invite-agent', async (req, res) => {
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    const { channel_name, requester_id } = body as { channel_name: string; requester_id: string };
+    const { channel_name, requester_id, game_state } = body as {
+      channel_name: string;
+      requester_id: string;
+      game_state?: GameStateSnapshot;
+    };
 
     if (!channel_name || !requester_id) {
       res.status(400).json({ error: 'channel_name and requester_id are required' });
       return;
     }
 
+    // Store initial game state if provided alongside the invite
+    if (game_state) {
+      sessionStore.set(channel_name, game_state);
+    }
+
     const appId = requireEnv('AGORA_APP_ID');
     const appCertificate = requireEnv('AGORA_APP_CERTIFICATE');
 
     const client = new AgoraClient({ area: Area.US, appId, appCertificate });
+
+    // Build tools when TOOL_BASE_URL is configured (requires public URL for Agora cloud)
+    const tools = TOOL_BASE_URL ? buildTools(TOOL_BASE_URL) : [];
+    const templateVariables = TOOL_BASE_URL ? { channel: channel_name } : {};
 
     const agent = new Agent({
       client,
@@ -131,7 +202,11 @@ app.post('/api/invite-agent', async (req, res) => {
         failureMessage: 'Signal lost, Pilot.',
         maxHistory: 15,
         params: { max_tokens: 256, temperature: 0.8, top_p: 0.95 },
-      }))
+        // templateVariables and tools are accepted by the SDK but not in TypeScript options;
+        // they are passed through to the wire format correctly.
+        ...(tools.length > 0 && { templateVariables, tools }),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any))
       .withTts(new MurfTTS({
         key: requireEnv('MURF_API_KEY'),
         voiceId: 'Matthew',
@@ -164,12 +239,17 @@ app.post('/api/invite-agent', async (req, res) => {
 app.post('/api/stop-conversation', async (req, res) => {
   try {
     const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-    const body = JSON.parse(rawBody) as { agent_id?: string };
-    const { agent_id } = body;
+    const body = JSON.parse(rawBody) as { agent_id?: string; channel?: string };
+    const { agent_id, channel } = body;
 
     if (!agent_id) {
       res.status(400).json({ error: 'agent_id is required' });
       return;
+    }
+
+    // Clean up session state if channel was provided
+    if (channel) {
+      sessionStore.delete(channel);
     }
 
     const appId = requireEnv('AGORA_APP_ID');
@@ -180,7 +260,6 @@ app.post('/api/stop-conversation', async (req, res) => {
     try {
       await client.stopAgent(agent_id);
     } catch (err) {
-      // Treat 404 / already-stopping as success
       const e = err as { statusCode?: number; body?: { reason?: string; detail?: string } };
       if (e?.statusCode === 404) {
         res.json({ success: true, state: 'already-stopped' });
@@ -205,4 +284,11 @@ app.post('/api/stop-conversation', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`VoiceStrike server running on http://localhost:${PORT}`);
+  if (TOOL_BASE_URL) {
+    console.log(`Game context tools enabled → ${TOOL_BASE_URL}`);
+  } else {
+    console.warn('TOOL_BASE_URL not set — game context tools disabled.');
+    console.warn('  To enable: run `npx cloudflared tunnel --url http://localhost:3001`');
+    console.warn('  then set TOOL_BASE_URL=<tunnel-url> in server/.env and restart.');
+  }
 });

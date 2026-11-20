@@ -4,5 +4,6 @@ export type {
   TranscriptEntry,
   AgoraVoiceConfig,
   AgoraVoiceCallbacks,
+  GameStateSnapshot,
 } from "./types.js";
 export { AGENT_UID } from "./types.js";

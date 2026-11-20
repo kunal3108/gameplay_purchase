@@ -14,6 +14,7 @@ import {
   AGENT_UID,
   type AgoraVoiceCallbacks,
   type AgoraVoiceConfig,
+  type GameStateSnapshot,
   type TranscriptEntry,
   type VoiceState,
 } from './types.js';
@@ -263,6 +264,21 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
       );
     }
   };
+
+  /**
+   * Push a live game state snapshot to the backend session store.
+   * The backend uses this to serve Agora's REST tool calls
+   * (`list_available_weapons`, `get_player_status`).
+   * Fire-and-forget — never throws.
+   */
+  pushGameState(state: GameStateSnapshot): void {
+    if (!this.channel) return; // not yet joined a channel
+    fetch(`${this.serverUrl}/api/session-state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel: this.channel, state }),
+    }).catch(() => {}); // best-effort, non-fatal
+  }
 
   destroy(): void {
     window.removeEventListener('beforeunload', this.handleUnload);
