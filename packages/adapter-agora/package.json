@@ -1,0 +1,26 @@
+{
+  "name": "@voice-commerce/adapter-agora",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@voice-commerce/core": "*",
+    "agora-rtc-sdk-ng": "^4.22.0",
+    "agora-rtm": "^2.2.0",
+    "agora-agent-client-toolkit": "latest"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

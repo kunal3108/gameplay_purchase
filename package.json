@@ -1,0 +1,15 @@
+{
+  "name": "voice-commerce",
+  "private": true,
+  "workspaces": ["packages/*", "examples/*"],
+  "scripts": {
+    "dev": "npm run dev --workspace=examples/voicestrike",
+    "dev:server": "cd examples/voicestrike/server && node --loader ts-node/esm server.ts",
+    "build": "npm run build --workspace=packages/core && npm run build --workspace=packages/adapter-agora && npm run build --workspace=examples/voicestrike",
+    "typecheck": "npm run typecheck --workspace=packages/core && npm run typecheck --workspace=packages/adapter-agora && npm run typecheck --workspace=examples/voicestrike",
+    "test": "npm run test --workspace=packages/core"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
