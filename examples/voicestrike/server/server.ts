@@ -4,11 +4,12 @@ import express from 'express';
 import cors from 'cors';
 import agoraToken from 'agora-token';
 const { RtcTokenBuilder, RtcRole } = agoraToken;
-import { AgoraClient, Agent, Area, DeepgramSTT, ExpiresIn, MurfTTS, OpenAI } from 'agora-agents';
+import { AgoraClient, Agent, AgentSession, AgoraError, Area, DeepgramSTT, ExpiresIn, MurfTTS, OpenAI } from 'agora-agents';
 import { sessionStore } from './sessionStore.js';
 import { commandBus } from './commandBus.js';
 import type { CommandResult } from './commandBus.js';
 import { buildTools, buildListWeaponsResponse, buildPlayerStatusResponse } from './gameTools.js';
+import { buildUCPRouter } from './ucpCheckout.js';
 import type { GameStateSnapshot } from './sessionStore.js';
 import { WEAPON_CATALOGUE } from './weaponCatalogue.js';
 
@@ -34,14 +35,20 @@ if (!TOOL_SECRET) {
 // The browser must include it as X-Write-Token on every /api/session-state POST.
 const writeTokenStore = new Map<string, string>();
 
-// ─── Agent ID store: maps channel → running agentId ──────────────────────────
+// ─── Agent session store: maps channel → running AgentSession ────────────────
 // Populated after /api/invite-agent succeeds; used by /api/agent-speak.
-const agentIdStore = new Map<string, string>();
+// Storing the session (not just the agentId) is required for app-credentials
+// auth mode: AgentSession._convoAIHeaders() generates fresh ConvoAI tokens per
+// call — a fresh AgoraClient has no session and therefore no token → HTTP 500.
+const agentSessionStore = new Map<string, AgentSession>();
 
 // Accept both JSON and plain-text bodies (sendBeacon sends text/plain)
 app.use(cors());
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
+
+// ─── UCP-inspired checkout endpoints ─────────────────────────────────────────
+app.use('/api/ucp', buildUCPRouter(sessionStore));
 
 // ─── Request logger ───────────────────────────────────────────────────────────
 // Logs method, path, status and latency. Never logs Authorization or token values.
@@ -494,9 +501,13 @@ app.post('/api/invite-agent', async (req, res) => {
 
     const client = new AgoraClient({ area: Area.US, appId, appCertificate });
 
-    // Build tools when TOOL_BASE_URL is configured (requires public URL for Agora cloud)
-    const tools = TOOL_BASE_URL ? buildTools(TOOL_BASE_URL, TOOL_SECRET) : [];
-    const templateVariables = TOOL_BASE_URL ? { channel: channel_name } : {};
+    // Build tools when TOOL_BASE_URL is configured (requires public URL for Agora cloud).
+    // Pass ?no_tools=true to skip tool registration — useful to isolate whether tool
+    // config (URL reachability, timeout) is causing the FAILED state.
+    const noTools = req.query['no_tools'] === 'true';
+    if (noTools) console.log('[invite] no_tools mode: tool registration skipped for isolation test');
+    const tools = (!noTools && TOOL_BASE_URL) ? buildTools(TOOL_BASE_URL, TOOL_SECRET) : [];
+    const templateVariables = (!noTools && TOOL_BASE_URL) ? { channel: channel_name } : {};
 
     const agent = new Agent({
       client,
@@ -556,9 +567,69 @@ app.post('/api/invite-agent', async (req, res) => {
     });
 
     const agentId = await session.start();
+    console.log(`[invite] Agent started: agentId=${agentId} channel=${channel_name} sdkStatus=${session.status} tools=${tools.length}`);
 
-    // Store agentId for proactive speak calls from the browser
-    agentIdStore.set(channel_name, agentId);
+    // Store session for proactive speak calls from the browser.
+    // Must keep the session object (not just agentId) so that session.say()
+    // can generate fresh ConvoAI tokens via AgentSession._convoAIHeaders().
+    agentSessionStore.set(channel_name, session);
+
+    // ── 5-second health probe ────────────────────────────────────────────────
+    // Agora cloud provisioning is async: session.start() returning does NOT
+    // guarantee the agent's TTS/LLM/STT pipeline is fully initialised and
+    // publishing audio. A 5 s poll via session.getInfo() surfaces any immediate
+    // failure (bad Murf key, OpenAI timeout, tool-config rejection, etc.)
+    // so the cause appears in the server log before the browser's 15 s timeout.
+    const startTs = Date.now();
+    setTimeout(async () => {
+      // Skip if the session was already cleaned up (timeout / disconnect)
+      if (agentSessionStore.get(channel_name) !== session) return;
+      try {
+        const info = await session.getInfo();
+        const elapsed = Math.round((Date.now() - startTs) / 100) / 10;
+        const infoMap = info as Record<string, unknown>;
+        const status = infoMap['status'] ?? 'unknown';
+        // Log the full response — omit nothing, credentials are not in this payload
+        console.log(`[invite:health] ${elapsed}s — agentId=${agentId} fullInfo=${JSON.stringify(infoMap)}`);
+        if (String(status) !== 'RUNNING') {
+          console.warn(
+            `[invite:health] Agent is NOT running (${String(status)}) — possible causes: ` +
+            `invalid MURF_API_KEY, bad TTS baseUrl, OpenAI credentials not set in Agora console, ` +
+            `or tool URL unreachable by Agora cloud (TOOL_BASE_URL=${TOOL_BASE_URL ?? 'not set'}).`,
+          );
+          // Fetch per-turn error details when available — reveals LLM_REQUEST_ERR, INTERNAL_ERR, etc.
+          try {
+            const turns = await session.getTurns({ page_size: 10 });
+            const turnsArr = (turns as Record<string, unknown>)['turns'];
+            const allTurns = Array.isArray(turnsArr) ? turnsArr : [];
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const errorTurns = allTurns.filter((t: any) => t?.end?.type === 'error' || t?.end?.metadata?.reason);
+            if (errorTurns.length > 0) {
+              console.error(`[invite:health] Error turns: ${JSON.stringify(errorTurns)}`);
+            } else {
+              console.log(`[invite:health] All turns (${allTurns.length}): ${JSON.stringify(allTurns)}`);
+            }
+          } catch (turnsErr) {
+            console.log(`[invite:health] getTurns unavailable: ${turnsErr instanceof Error ? turnsErr.message : String(turnsErr)}`);
+          }
+          agentSessionStore.delete(channel_name);
+        }
+      } catch (err) {
+        const e = err as { statusCode?: number };
+        if (e?.statusCode === 404) {
+          // Agent already terminated — most common failure mode
+          console.error(
+            `[invite:health] Agent 404 after 5s — agentId=${agentId} terminated before audio published. ` +
+            `Check: MURF_API_KEY validity, TTS baseUrl (${
+              'wss://global.api.murf.ai/v1/speech/stream-input'
+            }), OpenAI credentials in Agora console, and TOOL_BASE_URL reachability.`,
+          );
+        } else {
+          console.error(`[invite:health] getInfo failed: agentId=${agentId}`, err instanceof Error ? err.message : String(err));
+        }
+        agentSessionStore.delete(channel_name);
+      }
+    }, 5000);
 
     res.json({ agent_id: agentId, create_ts: Math.floor(Date.now() / 1000), state: 'RUNNING' });
   } catch (err) {
@@ -584,7 +655,7 @@ app.post('/api/stop-conversation', async (req, res) => {
     if (channel) {
       sessionStore.delete(channel);
       writeTokenStore.delete(channel);
-      agentIdStore.delete(channel);
+      agentSessionStore.delete(channel);
     }
 
     const appId = requireEnv('AGORA_APP_ID');
@@ -621,10 +692,12 @@ app.post('/api/stop-conversation', async (req, res) => {
 // Auth: same write-token as session-state to prevent external abuse.
 
 app.post('/api/agent-speak', async (req, res) => {
+  // Hoisted so the catch block can reference it for agentSessionStore cleanup.
+  let channel = '';
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
     const {
-      channel,
+      channel: channelParam,
       text,
       priority = 'APPEND',
       interruptable = true,
@@ -634,6 +707,7 @@ app.post('/api/agent-speak', async (req, res) => {
       priority?: string;
       interruptable?: boolean;
     };
+    channel = channelParam ?? '';
 
     if (!channel || !text) {
       res.status(400).json({ error: 'channel and text are required' });
@@ -652,19 +726,54 @@ app.post('/api/agent-speak', async (req, res) => {
       return;
     }
 
-    const agentId = agentIdStore.get(channel);
-    if (!agentId) {
+    const session = agentSessionStore.get(channel);
+    if (!session) {
       res.json({ ok: false, message: 'No active agent for this channel' });
       return;
     }
 
-    const appId = requireEnv('AGORA_APP_ID');
-    const appCertificate = requireEnv('AGORA_APP_CERTIFICATE');
-    const client = new AgoraClient({ area: Area.US, appId, appCertificate });
+    // Guard: only call say() when the SDK's local state is 'running'.
+    // After an ErrConflict the SDK status may still read 'running' (it doesn't
+    // receive autonomous termination events from Agora cloud), so this catches
+    // the cases where a previous SDK-side error already set status ≠ 'running'.
+    if (session.status !== 'running') {
+      console.warn(`[agent-speak] Session not running (status=${session.status}) — removing stale session for channel=${channel}`);
+      agentSessionStore.delete(channel);
+      res.json({ ok: false, message: `Agent not in running state (${session.status})` });
+      return;
+    }
 
-    await client.agents.speak({ appid: appId, agentId, text, priority: priority as 'INTERRUPT' | 'APPEND' | 'IGNORE', interruptable });
+    // session.say() uses the stored AgentSession which holds app-credentials auth
+    // and generates fresh ConvoAI tokens per call via _convoAIHeaders().
+    // A fresh AgoraClient({ appId, appCertificate }) has no session context and
+    // therefore cannot generate ConvoAI tokens → HTTP 500 on client.agents.speak().
+    await session.say(text, {
+      priority: priority as 'INTERRUPT' | 'APPEND' | 'IGNORE',
+      interruptable,
+    });
     res.json({ ok: true });
   } catch (err) {
+    // ── ErrConflict: Agora cloud reports agent is no longer running ───────────
+    // This happens when the agent terminates autonomously (bad credentials,
+    // TTS failure, idle-timeout, etc.) but the SDK's local status is still
+    // 'running' — it has no mechanism to receive autonomous termination events.
+    // Return ok:false (not 500) and clean up the stale store entry.
+    const isAgoraConflict =
+      (err instanceof AgoraError && err.statusCode === 400) ||
+      (err instanceof Error && err.message.toLowerCase().includes('cannot say'));
+    if (isAgoraConflict) {
+      const body = err instanceof AgoraError
+        ? (err.body as { reason?: string; detail?: string } | undefined)
+        : undefined;
+      const detail = body?.detail ?? (err instanceof Error ? err.message : '');
+      console.warn(
+        `[agent-speak] Agent conflict for channel=${channel}: ${detail || 'agent not in running state'}. ` +
+        `Removing stale session. Possible cause: agent terminated due to TTS/LLM failure or idle-timeout.`,
+      );
+      agentSessionStore.delete(channel);
+      res.json({ ok: false, message: 'Agent is no longer active — voice AI may need to reconnect.' });
+      return;
+    }
     console.error('Agent speak error:', err);
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }

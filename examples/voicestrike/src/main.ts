@@ -121,6 +121,11 @@ if (appId) {
     // Connect Jarvis
     try {
       await adapter.connect();
+      // Push initial game state so the tool endpoints have data before the agent
+      // speaks. wireGameEvents fires via sceneReady during the connect() awaits,
+      // but adapter.channel is null at that point — push explicitly here to fix
+      // the race. (onStateChange:'connected' also pushes, but that fires later.)
+      pushState();
       startScreen.hide();
       instructionsPanel.show();
     } catch {
@@ -229,8 +234,12 @@ if (appId) {
       game.scene.start('GameScene');
     });
 
-    // Reconnect with a fresh Agora session
+    // Reconnect with a fresh Agora session, then push state immediately.
+    // wireGameEvents fires via sceneReady above — before adapter.connect() sets
+    // the channel — so the initial pushState() inside it is a no-op. Push here
+    // so the tool endpoints have data as soon as the agent can call them.
     await adapter.connect();
+    pushState();
   }
 
   async function stopGame(): Promise<void> {

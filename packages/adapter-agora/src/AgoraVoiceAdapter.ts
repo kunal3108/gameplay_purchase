@@ -353,12 +353,17 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
     // 1. Stop agent
     if (this.agentId) {
       const id = this.agentId;
+      // Capture channel before nulling — stop-conversation uses it to clean up
+      // agentSessionStore, writeTokenStore and sessionStore server-side.
+      // Without channel, agentSessionStore is never cleaned up and dead sessions
+      // remain in the store, causing ErrConflict 500s on subsequent speak calls.
+      const ch = this.channel;
       this.agentId = null;
       try {
         await fetch(`${this.serverUrl}/api/stop-conversation`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ agent_id: id }),
+          body: JSON.stringify({ agent_id: id, channel: ch }),
         });
       } catch { /* best-effort */ }
     }
@@ -481,7 +486,13 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
    */
   requestProactiveRecommendation(text: string): void {
     if (!this.channel || !this.writeToken) return;
-    if (this.state === 'idle' || this.state === 'error' || this.state === 'disconnecting') return;
+    // Only fire when the agent is fully connected and ready to accept speak commands.
+    // Allowing 'connecting' would race against the 15 s timeout cleanup window:
+    // cleanup() defers setState('error') until after the stop-conversation fetch,
+    // so the state remains 'connecting' briefly while the agent is already dead →
+    // agent-speak 500 ErrConflict.  'listening' and 'speaking' are sub-states of
+    // connected and are always safe.
+    if (this.state !== 'connected' && this.state !== 'listening' && this.state !== 'speaking') return;
     fetch(`${this.serverUrl}/api/agent-speak`, {
       method: 'POST',
       headers: {
