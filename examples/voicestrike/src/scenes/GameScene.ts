@@ -116,6 +116,58 @@ export class GameScene extends Phaser.Scene {
   }
 
   /**
+   * Purchase a weapon via voice command. Returns the verified result so the
+   * voice layer can relay it to Agora before Striker speaks.
+   * Uses `commandId` as the CommerceEngine idempotency key to survive Agora retries.
+   */
+  async purchaseWeaponVoice(
+    id: WeaponId,
+    commandId: string,
+  ): Promise<{ ok: boolean; message: string }> {
+    const def = WEAPON_CATALOGUE.find(d => d.id === id);
+    if (!def) return { ok: false, message: `Unknown weapon: ${id}` };
+
+    const result = await this.commerce.purchase(id, { idempotencyKey: commandId });
+
+    if (result.ok) {
+      this.notify(`${result.item.name} purchased! −${def.price} coins`, '#00ff88');
+      await this.commerce.equip(id); // auto-equip; non-fatal if it fails
+      return { ok: true, message: `${result.item.name} purchased and equipped` };
+    }
+    if (result.reason === 'already_owned') {
+      return { ok: false, message: `${def.name} already owned` };
+    }
+    if (result.reason === 'insufficient_funds') {
+      return {
+        ok: false,
+        message: `Not enough coins — ${def.name} costs ${def.price}, you have ${this.wallet.balance}`,
+      };
+    }
+    if (result.reason === 'concurrent_request') {
+      return { ok: false, message: 'Purchase already in progress, try again shortly' };
+    }
+    return { ok: false, message: `Purchase failed: ${result.reason}` };
+  }
+
+  /**
+   * Equip a weapon via voice command. Returns the verified result.
+   */
+  async equipWeaponVoice(id: WeaponId): Promise<{ ok: boolean; message: string }> {
+    const def = WEAPON_CATALOGUE.find(d => d.id === id);
+    if (!def) return { ok: false, message: `Unknown weapon: ${id}` };
+
+    const result = await this.commerce.equip(id);
+
+    if (result.ok) {
+      return { ok: true, message: `${result.item.name} equipped` };
+    }
+    if (result.reason === 'not_owned') {
+      return { ok: false, message: `${def.name} not owned — purchase it first` };
+    }
+    return { ok: false, message: `Equip failed: ${result.reason}` };
+  }
+
+  /**
    * Purchase a weapon via the CommerceEngine, then auto-equip on success.
    * Balance deduction and inventory updates happen through WalletStore adapters.
    * Fire-and-forget — callers do not need to await.
@@ -338,9 +390,17 @@ export class GameScene extends Phaser.Scene {
       this.player,
       this.enemies,
       (p, e) => {
+        const player = p as unknown as Player;
         const enemy = e as unknown as Enemy;
-        (p as unknown as Player).takeDamage(enemy.damage, this.time.now);
-        this.events.emit('healthChanged', this.player.health, this.player.maxHealth);
+        const prevHealth = player.health;
+        player.takeDamage(enemy.damage, this.time.now);
+        // Only emit when health actually changed — the invulnerability window means
+        // takeDamage() is a no-op for most frames during overlap, but the callback
+        // fires every physics step (~60/s). Emitting only on real changes prevents
+        // flooding the voice backend with redundant session-state pushes.
+        if (player.health !== prevHealth) {
+          this.events.emit('healthChanged', this.player.health, this.player.maxHealth);
+        }
       },
     );
   }
@@ -483,5 +543,7 @@ export class GameScene extends Phaser.Scene {
     this.add.text(400, 340, 'Refresh to play again', {
       fontSize: '22px', color: '#888888', fontFamily: 'Arial',
     }).setOrigin(0.5).setDepth(10);
+    // Signal voice layer to stop synchronising state — the session is over.
+    this.events.emit('gameOver');
   }
 }

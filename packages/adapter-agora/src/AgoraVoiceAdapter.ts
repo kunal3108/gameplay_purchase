@@ -16,6 +16,8 @@ import {
   type AgoraVoiceConfig,
   type GameStateSnapshot,
   type TranscriptEntry,
+  type VoiceCommand,
+  type VoiceCommandResult,
   type VoiceState,
 } from './types.js';
 
@@ -46,8 +48,12 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
   // Mic mute state
   private micMuted = false;
 
-  // Write token for authorised session-state pushes
+  // Write token for authorised session-state pushes and command-stream auth
   private writeToken: string | null = null;
+
+  // SSE command stream — receives purchase/equip commands from the backend
+  private commandStream: EventSource | null = null;
+  private commandCallback: ((cmd: VoiceCommand) => Promise<VoiceCommandResult>) | null = null;
 
   constructor(config: AgoraVoiceConfig, callbacks: AgoraVoiceCallbacks = {}) {
     this.appId = config.appId;
@@ -77,6 +83,16 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
     return this.state;
   }
 
+  /**
+   * Register a handler that is called whenever the backend sends a purchase or
+   * equip command via the SSE stream. The handler must return a result that is
+   * POSTed back so the backend can resolve the Agora tool call.
+   * Call this once before invoking `connect()`.
+   */
+  onCommand(callback: (cmd: VoiceCommand) => Promise<VoiceCommandResult>): void {
+    this.commandCallback = callback;
+  }
+
   async setMicEnabled(enabled: boolean): Promise<void> {
     this.micMuted = !enabled;
     if (this.micTrack) {
@@ -97,6 +113,9 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
       this.uid = uid;
       this.channel = channel;
       this.writeToken = writeToken ?? null;
+
+      // 1b. Open command SSE stream so the backend can push purchase/equip commands.
+      this.openCommandStream();
 
       // 2. Create microphone track — catch permission denial
       try {
@@ -256,9 +275,61 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
       this.rtcClient = null;
     }
 
+    // 6. Close command SSE stream
+    if (this.commandStream) {
+      this.commandStream.close();
+      this.commandStream = null;
+    }
+
     this.uid = null;
     this.channel = null;
     this.writeToken = null;
+  }
+
+  /**
+   * Open an SSE connection to receive purchase/equip commands from the backend.
+   * EventSource auto-reconnects on transient failures.
+   * Auth is via write_token query param (EventSource doesn't support custom headers).
+   */
+  private openCommandStream(): void {
+    if (!this.channel || !this.writeToken) return;
+    const url =
+      `${this.serverUrl}/api/commands/stream` +
+      `?channel=${encodeURIComponent(this.channel)}` +
+      `&write_token=${encodeURIComponent(this.writeToken)}`;
+
+    this.commandStream = new EventSource(url);
+
+    this.commandStream.onmessage = (event: MessageEvent) => {
+      if (!this.commandCallback) return;
+      let cmd: VoiceCommand;
+      try {
+        cmd = JSON.parse(event.data as string) as VoiceCommand;
+      } catch {
+        return; // ignore malformed events
+      }
+      this.commandCallback(cmd)
+        .then(result => this.postCommandResult(cmd.id, result))
+        .catch(() => this.postCommandResult(cmd.id, { ok: false, message: 'Command execution error' }));
+    };
+
+    this.commandStream.onerror = () => {
+      // EventSource handles reconnection automatically; this is just for visibility.
+      console.debug('[VoiceAdapter] Command stream reconnecting...');
+    };
+  }
+
+  /** POST the browser-side result back so the backend can resolve the Agora tool call. */
+  private postCommandResult(commandId: string, result: VoiceCommandResult): void {
+    if (!this.channel || !this.writeToken) return;
+    fetch(`${this.serverUrl}/api/commands/result`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Write-Token': this.writeToken,
+      },
+      body: JSON.stringify({ channel: this.channel, commandId, result }),
+    }).catch(() => {}); // best-effort
   }
 
   private readonly handleUnload = (): void => {

@@ -83,46 +83,82 @@ describe('buildPlayerStatusResponse', () => {
 
 describe('buildTools', () => {
   const SECRET = 'test-secret-abc123';
+  const BASE = 'https://example.com';
 
-  it('returns two tools', () => {
-    const tools = buildTools('https://example.com', SECRET);
-    expect(tools).toHaveLength(2);
+  it('returns four tools', () => {
+    expect(buildTools(BASE, SECRET)).toHaveLength(4);
   });
 
   it('tool names are correct', () => {
-    const tools = buildTools('https://example.com', SECRET);
+    const tools = buildTools(BASE, SECRET);
     expect(tools[0]!.function.name).toBe('list_available_weapons');
     expect(tools[1]!.function.name).toBe('get_player_status');
+    expect(tools[2]!.function.name).toBe('purchase_weapon');
+    expect(tools[3]!.function.name).toBe('equip_weapon');
   });
 
-  it('tool URLs contain the base URL and channel template variable but NOT the secret', () => {
-    const tools = buildTools('https://my-tunnel.example.com', SECRET);
-    for (const tool of tools) {
-      expect(tool.server.url).toContain('https://my-tunnel.example.com');
-      expect(tool.server.url).toContain('{{template_variables.channel}}');
-      // Secret must not appear in the URL — it belongs in the Authorization header only
-      expect(tool.server.url).not.toContain(SECRET);
+  it('GET tool URLs contain base URL, channel template, and no secret', () => {
+    const tools = buildTools('https://tunnel.example.com', SECRET);
+    const getTools = tools.filter(t => t.server.method === 'GET');
+    expect(getTools).toHaveLength(2);
+    for (const t of getTools) {
+      expect(t.server.url).toContain('https://tunnel.example.com');
+      expect(t.server.url).toContain('{{template_variables.channel}}');
+      expect(t.server.url).not.toContain(SECRET);
     }
   });
 
-  it('tool headers include Authorization: Bearer <secret>', () => {
-    const tools = buildTools('https://example.com', SECRET);
-    for (const tool of tools) {
-      expect(tool.server.headers?.['Authorization']).toBe(`Bearer ${SECRET}`);
+  it('POST tools have correct body with channel, weapon_id and tool_call_id', () => {
+    const tools = buildTools(BASE, SECRET);
+    const postTools = tools.filter(t => t.server.method === 'POST');
+    expect(postTools).toHaveLength(2);
+    for (const t of postTools) {
+      const body = t.server.body as Record<string, string>;
+      expect(body['tool_call_id']).toBe('{{tool_call_id}}');
+      expect(body['channel']).toBe('{{template_variables.channel}}');
+      expect(body['weapon_id']).toBe('{{args.weapon_id}}');
+    }
+  });
+
+  it('POST tools do not embed secret in body or URL', () => {
+    const tools = buildTools(BASE, SECRET);
+    for (const t of tools.filter(t => t.server.method === 'POST')) {
+      expect(t.server.url).not.toContain(SECRET);
+      expect(JSON.stringify(t.server.body)).not.toContain(SECRET);
+    }
+  });
+
+  it('purchase_weapon has weapon_id as required enum parameter', () => {
+    const purchase = buildTools(BASE, SECRET).find(t => t.function.name === 'purchase_weapon')!;
+    const props = purchase.function.parameters?.properties as Record<string, unknown>;
+    expect(props['weapon_id']).toBeDefined();
+    const weaponParam = props['weapon_id'] as Record<string, unknown>;
+    expect(weaponParam['enum']).toContain('shotgun');
+    expect(purchase.function.parameters?.required).toContain('weapon_id');
+  });
+
+  it('equip_weapon has weapon_id as required enum parameter', () => {
+    const equip = buildTools(BASE, SECRET).find(t => t.function.name === 'equip_weapon')!;
+    const props = equip.function.parameters?.properties as Record<string, unknown>;
+    expect((props['weapon_id'] as Record<string, unknown>)['enum']).toContain('laser');
+    expect(equip.function.parameters?.required).toContain('weapon_id');
+  });
+
+  it('all tools use Authorization: Bearer <secret> header', () => {
+    for (const t of buildTools(BASE, SECRET)) {
+      expect(t.server.headers?.['Authorization']).toBe(`Bearer ${SECRET}`);
     }
   });
 
   it('all tools use sync execution mode', () => {
-    const tools = buildTools('https://example.com', SECRET);
-    for (const tool of tools) {
-      expect(tool.execution?.mode).toBe('sync');
+    for (const t of buildTools(BASE, SECRET)) {
+      expect(t.execution?.mode).toBe('sync');
     }
   });
 
-  it('timeout is set within Agora allowed range (1000–100000ms)', () => {
-    const tools = buildTools('https://example.com', SECRET);
-    for (const tool of tools) {
-      const ms = tool.server.timeout_ms as number;
+  it('all tools have timeout within Agora allowed range (1000–100000ms)', () => {
+    for (const t of buildTools(BASE, SECRET)) {
+      const ms = t.server.timeout_ms as number;
       expect(ms).toBeGreaterThanOrEqual(1000);
       expect(ms).toBeLessThanOrEqual(100_000);
     }

@@ -47,3 +47,22 @@ export interface GameStateSnapshot {
   maxHealth: number;
   wave: number;
 }
+
+/** Actions the backend can send to the browser for execution. */
+export type VoiceCommandAction = 'purchase' | 'equip';
+
+/**
+ * A command pushed from the backend to the browser via SSE.
+ * The `id` matches Agora's tool_call_id, used as a CommerceEngine idempotency key.
+ */
+export interface VoiceCommand {
+  id: string;
+  action: VoiceCommandAction;
+  weaponId: string;
+}
+
+/** Result sent back from the browser after executing a VoiceCommand. */
+export interface VoiceCommandResult {
+  ok: boolean;
+  message: string;
+}

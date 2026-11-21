@@ -6,8 +6,13 @@ import agoraToken from 'agora-token';
 const { RtcTokenBuilder, RtcRole } = agoraToken;
 import { AgoraClient, Agent, Area, DeepgramSTT, ExpiresIn, MurfTTS, OpenAI } from 'agora-agents';
 import { sessionStore } from './sessionStore.js';
+import { commandBus } from './commandBus.js';
+import type { CommandResult } from './commandBus.js';
 import { buildTools, buildListWeaponsResponse, buildPlayerStatusResponse } from './gameTools.js';
 import type { GameStateSnapshot } from './sessionStore.js';
+
+const VALID_WEAPON_IDS = ['pistol', 'shotgun', 'laser'] as const;
+type WeaponId = typeof VALID_WEAPON_IDS[number];
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3001;
@@ -33,6 +38,26 @@ app.use(cors());
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
+// ─── Request logger ───────────────────────────────────────────────────────────
+// Logs method, path, status and latency. Never logs Authorization or token values.
+app.use((req, _res, next) => {
+  const start = Date.now();
+  _res.on('finish', () => {
+    const ms = Date.now() - start;
+    const auth = req.headers['authorization'] ? '[Bearer ***]' : '[none]';
+    const hasWriteToken = req.headers['x-write-token'] ? '[present]' : '[none]';
+    const extra = req.path.startsWith('/api/tools/')
+      ? ` auth=${auth}`
+      : req.path === '/api/session-state' || req.path === '/api/commands/result'
+        ? ` write-token=${hasWriteToken}`
+        : req.path === '/api/commands/stream'
+          ? ` channel=${req.query['channel'] ?? '?'}`
+          : '';
+    console.log(`${req.method} ${req.path} → ${_res.statusCode} (${ms}ms)${extra}`);
+  });
+  next();
+});
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
@@ -45,27 +70,38 @@ const STRIKER_PROMPT = `You are **Striker**, a tactical AI co-pilot embedded in 
 
 # Your Role
 You are the player's voice-controlled mission control. You can:
-- Comment on the battle as it unfolds
-- Give tactical tips (aim, movement, enemy patterns)
-- Report live game stats using your tools
-- Help the player decide when to visit the shop
+- Report live game stats
+- Purchase weapons for the player
+- Switch the player's equipped weapon
+- Give tactical tips
 
-# Tools — Always call before answering
-You have two tools that give you live data directly from the game engine:
-- **list_available_weapons** — call this BEFORE answering ANY question about weapons, their prices, or what the player can buy. Never state prices from memory.
-- **get_player_status** — call this BEFORE answering ANY question about health, coins, wave number, or current weapon. Never guess these values.
+# Tools — call before answering or acting
 
-If a tool call fails or returns an error, say: "Signal lost — data unavailable, Pilot."
+**Discovery (call first, never guess):**
+- **list_available_weapons** — call BEFORE any question about weapons, prices, or affordability.
+- **get_player_status** — call BEFORE any question about health, coins, wave, or current weapon.
+
+**Action (require explicit player intent):**
+- **purchase_weapon(weapon_id)** — call when the player clearly asks to buy a weapon. Always call list_available_weapons first to confirm they can afford it and don't already own it. If the player names an ambiguous weapon (e.g. "the gun"), ask which one before calling.
+- **equip_weapon(weapon_id)** — call when the player asks to switch or equip a weapon they own.
+
+# Result handling — strict rules
+- **Never confirm success before the tool returns ok:true.** If the tool returns ok:false, relay the actual reason. Example responses:
+  - ok:false, "insufficient_funds" → "Not enough coins for that, Pilot."
+  - ok:false, "already_owned" → "You already have that one, Pilot."
+  - ok:false, "not_owned" → "You don't own that — buy it first, Pilot."
+  - ok:false, "timed out" → "Signal lost — try again, Pilot."
+- **Never invent tool results.** If a tool call fails technically, say: "Signal lost — data unavailable, Pilot."
 
 # Tone
 - Brief, punchy, battle-ready. Max 1–2 sentences per reply.
 - Sound like a cool fighter pilot, not a customer service bot.
-- Never break immersion with technical jargon about APIs or SDKs.
+- Never break immersion with technical jargon.
 
 # Rules
 - Keep responses SHORT — this is a voice overlay on an active game.
-- Ask at most one question per turn.
-- If you don't know something, say "Unknown, Pilot" and move on.`;
+- Ask at most one clarifying question per turn.
+- Weapon IDs for tools: pistol, shotgun, laser (all lowercase).`;
 
 const STRIKER_GREETING = `Striker online. Ready to roll, Pilot?`;
 
@@ -182,6 +218,133 @@ app.get('/api/tools/get_player_status', (req, res) => {
     return;
   }
   res.json(buildPlayerStatusResponse(state));
+});
+
+// ─── SSE command stream (browser → listens for backend-pushed commands) ──────
+
+app.get('/api/commands/stream', (req, res) => {
+  const channel = req.query['channel'] as string | undefined;
+  const writeToken = req.query['write_token'] as string | undefined;
+
+  // Validate using the same write-token store as session-state
+  const expectedToken = channel ? writeTokenStore.get(channel) : undefined;
+  if (!channel || !writeToken || !expectedToken || writeToken !== expectedToken) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const cleanup = commandBus.registerStream(channel, res);
+
+  // Confirm stream is ready — browser uses this to know when commands can be received
+  res.write(': connected\n\n');
+
+  // Keep-alive comment every 25 s — prevents idle connection teardown
+  const heartbeat = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch { clearInterval(heartbeat); }
+  }, 25_000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    cleanup();
+  });
+});
+
+// ─── Command result (browser → posts execution result back) ──────────────────
+
+app.post('/api/commands/result', (req, res) => {
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { channel, commandId, result } = body as {
+      channel?: string;
+      commandId?: string;
+      result?: CommandResult;
+    };
+
+    if (!channel || !commandId || !result || typeof result.ok !== 'boolean') {
+      res.status(400).json({ error: 'channel, commandId and result are required' });
+      return;
+    }
+
+    // Validate write token — same guard as session-state
+    const providedToken = req.headers['x-write-token'];
+    const expectedToken = writeTokenStore.get(channel);
+    if (!providedToken || !expectedToken || providedToken !== expectedToken) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const resolved = commandBus.resolveCommand(commandId, result);
+    // resolved=false means the command timed out before the result arrived — that's OK
+    res.json({ ok: resolved });
+  } catch {
+    res.status(400).json({ error: 'Invalid request body' });
+  }
+});
+
+// ─── Purchase weapon tool (called by Agora cloud) ────────────────────────────
+
+app.post('/api/tools/purchase_weapon', async (req, res) => {
+  if (!requireToolAuth(req, res)) return;
+
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { channel, weapon_id, tool_call_id } = body as {
+      channel?: string;
+      weapon_id?: string;
+      tool_call_id?: string;
+    };
+
+    if (!channel || !weapon_id) {
+      res.json({ ok: false, message: 'channel and weapon_id are required' });
+      return;
+    }
+    if (!VALID_WEAPON_IDS.includes(weapon_id as WeaponId)) {
+      res.json({ ok: false, message: `Unknown weapon: "${weapon_id}". Valid options: ${VALID_WEAPON_IDS.join(', ')}` });
+      return;
+    }
+
+    // Use tool_call_id as idempotency key so Agora retries hit CommerceEngine's cache
+    const commandId = tool_call_id ?? randomUUID();
+    const result = await commandBus.dispatch(channel, 'purchase', weapon_id, commandId);
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, message: `Purchase error: ${err instanceof Error ? err.message : String(err)}` });
+  }
+});
+
+// ─── Equip weapon tool (called by Agora cloud) ───────────────────────────────
+
+app.post('/api/tools/equip_weapon', async (req, res) => {
+  if (!requireToolAuth(req, res)) return;
+
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { channel, weapon_id, tool_call_id } = body as {
+      channel?: string;
+      weapon_id?: string;
+      tool_call_id?: string;
+    };
+
+    if (!channel || !weapon_id) {
+      res.json({ ok: false, message: 'channel and weapon_id are required' });
+      return;
+    }
+    if (!VALID_WEAPON_IDS.includes(weapon_id as WeaponId)) {
+      res.json({ ok: false, message: `Unknown weapon: "${weapon_id}". Valid options: ${VALID_WEAPON_IDS.join(', ')}` });
+      return;
+    }
+
+    const commandId = tool_call_id ?? randomUUID();
+    const result = await commandBus.dispatch(channel, 'equip', weapon_id, commandId);
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, message: `Equip error: ${err instanceof Error ? err.message : String(err)}` });
+  }
 });
 
 // ─── Agent invite endpoint ────────────────────────────────────────────────────

@@ -5,5 +5,8 @@ export type {
   AgoraVoiceConfig,
   AgoraVoiceCallbacks,
   GameStateSnapshot,
+  VoiceCommand,
+  VoiceCommandAction,
+  VoiceCommandResult,
 } from "./types.js";
 export { AGENT_UID } from "./types.js";

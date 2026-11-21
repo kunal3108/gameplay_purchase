@@ -30,6 +30,15 @@ export function buildPlayerStatusResponse(state: GameStateSnapshot): object {
 
 // ─── Tool definitions sent to Agora at agent-start time ──────────────────────
 
+/** Weapon IDs the agent may reference. Must match the in-game catalogue. */
+const WEAPON_IDS = ['pistol', 'shotgun', 'laser'] as const;
+
+const weaponIdParam = {
+  type: 'string',
+  description: 'The weapon to act on. Must be exactly one of: pistol, shotgun, laser.',
+  enum: [...WEAPON_IDS],
+} as const;
+
 /**
  * Build the LlmTool array for the agent config.
  * @param toolBaseUrl - Publicly accessible base URL (required for Agora cloud to reach).
@@ -44,6 +53,7 @@ export function buildTools(toolBaseUrl: string, secret: string): LlmTool[] {
   };
 
   return [
+    // ── Read-only discovery tools ────────────────────────────────────────────
     {
       type: 'function',
       function: {
@@ -77,6 +87,64 @@ export function buildTools(toolBaseUrl: string, secret: string): LlmTool[] {
         method: 'GET',
         url: `${toolBaseUrl}/api/tools/get_player_status?channel={{template_variables.channel}}`,
         headers: authHeaders,
+        timeout_ms: 5000,
+      },
+    },
+    // ── Action tools — backend delivers to browser, waits for verified result ─
+    {
+      type: 'function',
+      function: {
+        name: 'purchase_weapon',
+        description:
+          'Purchase a weapon for the player using their coin balance and automatically equip it. ' +
+          'Always call list_available_weapons first to confirm the player can afford it and does not already own it. ' +
+          'Only call this when the player explicitly asks to buy a weapon. ' +
+          'Returns ok:true with a confirmation message, or ok:false with the actual reason (e.g. insufficient_funds, already_owned). ' +
+          'Never claim a purchase succeeded without receiving ok:true from this tool.',
+        parameters: {
+          type: 'object',
+          properties: { weapon_id: weaponIdParam },
+          required: ['weapon_id'],
+        },
+      },
+      execution: { mode: 'sync' },
+      server: {
+        method: 'POST',
+        url: `${toolBaseUrl}/api/tools/purchase_weapon`,
+        headers: authHeaders,
+        body: {
+          tool_call_id: '{{tool_call_id}}',
+          channel: '{{template_variables.channel}}',
+          weapon_id: '{{args.weapon_id}}',
+        },
+        timeout_ms: 5000,
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'equip_weapon',
+        description:
+          'Switch the player\'s active weapon during gameplay. ' +
+          'The player must already own the weapon (use list_available_weapons to check). ' +
+          'Returns ok:true when the weapon is equipped, or ok:false if not owned. ' +
+          'Never claim equip succeeded without receiving ok:true from this tool.',
+        parameters: {
+          type: 'object',
+          properties: { weapon_id: weaponIdParam },
+          required: ['weapon_id'],
+        },
+      },
+      execution: { mode: 'sync' },
+      server: {
+        method: 'POST',
+        url: `${toolBaseUrl}/api/tools/equip_weapon`,
+        headers: authHeaders,
+        body: {
+          tool_call_id: '{{tool_call_id}}',
+          channel: '{{template_variables.channel}}',
+          weapon_id: '{{args.weapon_id}}',
+        },
         timeout_ms: 5000,
       },
     },

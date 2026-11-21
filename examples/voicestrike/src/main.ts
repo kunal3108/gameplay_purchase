@@ -3,8 +3,9 @@ import { GameScene } from './scenes/GameScene';
 import { UIScene } from './scenes/UIScene';
 import { ShopScene } from './scenes/ShopScene';
 import { AgoraVoiceAdapter } from '@voice-commerce/adapter-agora';
-import type { GameStateSnapshot } from '@voice-commerce/adapter-agora';
+import type { GameStateSnapshot, VoiceCommand } from '@voice-commerce/adapter-agora';
 import { VoiceHUD } from './voice/VoiceHUD';
+import type { WeaponId } from './types/game';
 
 const config: Phaser.Types.Core.GameConfig = {
   type: Phaser.AUTO,
@@ -49,6 +50,21 @@ if (appId) {
 
   hud = new VoiceHUD(adapter);
 
+  // ── Wire command handler — executes backend-pushed purchase/equip in GameScene ─
+  adapter.onCommand(async (cmd: VoiceCommand) => {
+    // GameScene may not be active yet (e.g. command arrived before 'ready')
+    const gs = game.scene.getScene('GameScene') as unknown as GameScene | null;
+    if (!gs) return { ok: false, message: 'Game scene not available' };
+
+    if (cmd.action === 'purchase') {
+      return gs.purchaseWeaponVoice(cmd.weaponId as WeaponId, cmd.id);
+    }
+    if (cmd.action === 'equip') {
+      return gs.equipWeaponVoice(cmd.weaponId as WeaponId);
+    }
+    return { ok: false, message: `Unknown action: ${cmd.action}` };
+  });
+
   const container = document.getElementById('game-container');
   if (container) {
     hud.mount(container);
@@ -67,6 +83,16 @@ if (appId) {
     gs.events.on('healthChanged', pushState);
     gs.events.on('waveChanged', pushState);
     gs.events.on('weaponChanged', pushState);
+
+    // Stop synchronising when the game ends — prevents unbounded POST flood
+    // from physics overlap callbacks that keep firing after GAME OVER.
+    gs.events.once('gameOver', () => {
+      gs.events.off('walletChanged', pushState);
+      gs.events.off('healthChanged', pushState);
+      gs.events.off('waveChanged', pushState);
+      gs.events.off('weaponChanged', pushState);
+      void adapter.disconnect();
+    });
   });
 
   /** Reads live state from GameScene and pushes it to the backend. */
