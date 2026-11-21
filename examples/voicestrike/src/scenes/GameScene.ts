@@ -12,8 +12,9 @@ import type { WeaponId, FireContext } from '../types/game';
 import type { WeaponBase } from '../weapons/WeaponBase';
 
 export class GameScene extends Phaser.Scene {
-  // Public so ShopScene can read state without coupling to Phaser internals
-  readonly wallet: WalletStore = new WalletStore();
+  // Public so ShopScene / ShopHUDScene can read state without Phaser internals coupling.
+  // Initialized in create() so it resets on scene.restart().
+  wallet!: WalletStore;
   private commerce!: CommerceEngine;
 
   private player!: Player;
@@ -30,9 +31,22 @@ export class GameScene extends Phaser.Scene {
     S: Phaser.Input.Keyboard.Key;
     D: Phaser.Input.Keyboard.Key;
   };
+  private enterKey!: Phaser.Input.Keyboard.Key;
+  private jKey!: Phaser.Input.Keyboard.Key;
+  private kKey!: Phaser.Input.Keyboard.Key;
   private waitingForNextWave = false;
   private gameOverShown = false;
+  private _paused = false;
+  private pauseOverlay: Phaser.GameObjects.Text | null = null;
+  private _enemyThresholdReached = false;
   private readonly playerSpeed = 200;
+
+  // Unified aim angle — shared by handleAiming() and fireWeapon()
+  private aimAngle = 0;
+  private keyboardAimActive = false;
+  private lastMouseX = 0;
+  private lastMouseY = 0;
+  private readonly AIM_ROTATION_SPEED = 2.5; // radians per second
 
   constructor() {
     super({ key: 'GameScene' });
@@ -54,11 +68,31 @@ export class GameScene extends Phaser.Scene {
     return this.waveManager ? this.waveManager.currentWave : 0;
   }
 
+  get isPaused(): boolean {
+    return this._paused;
+  }
+
+  get enemyCount(): number {
+    return this.enemies ? this.enemies.getLength() : 0;
+  }
+
   preload(): void {
     this.generateTextures();
   }
 
   create(): void {
+    // Reset all game state — called on initial start AND on scene.restart()
+    this.wallet = new WalletStore();
+    this._paused = false;
+    this.gameOverShown = false;
+    this.waitingForNextWave = false;
+    this.pauseOverlay = null;
+    this._enemyThresholdReached = false;
+    this.aimAngle = 0;
+    this.keyboardAimActive = false;
+    this.lastMouseX = 0;
+    this.lastMouseY = 0;
+
     this.createArena();
 
     this.enemies = this.physics.add.group();
@@ -72,13 +106,22 @@ export class GameScene extends Phaser.Scene {
     this.setupPhysics();
     this.initCommerce();
 
-    this.scene.launch('UIScene');
+    if (!this.scene.isActive('UIScene')) this.scene.launch('UIScene');
+    if (!this.scene.isActive('ShopHUDScene')) this.scene.launch('ShopHUDScene');
     this.waveManager = new WaveManager(this, this.enemies);
-    this.waveManager.startNextWave();
+    // 8-second grace period: gives the player time to hear Jarvis's greeting
+    // before the first enemies spawn. Restart restores this delay automatically
+    // because create() runs fresh on every scene.start().
+    this.waveManager.scheduleFirstWave(8_000);
+
+    // Signal to main.ts that this scene is fully created and ready for event wiring.
+    // Using delayedCall(1) defers to the next game step — safely after create() returns.
+    this.time.delayedCall(1, () => { this.events.emit('sceneReady'); });
   }
 
-  update(time: number, _delta: number): void {
-    // Freeze game loop while shop is open
+  update(time: number, delta: number): void {
+    // Freeze game loop while paused or shop is open
+    if (this._paused) return;
     if (this.scene.isActive('ShopScene')) return;
 
     if (!this.player.isAlive()) {
@@ -86,17 +129,19 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    this.updateAimAngle(delta); // must run before handleAiming + fireWeapon
     this.handleMovement();
     this.handleAiming();
     this.laserGraphics.clear();
 
-    if (this.input.activePointer.isDown) {
+    if (this.input.activePointer.isDown || this.enterKey.isDown) {
       this.fireWeapon(time);
     }
 
     this.updateEnemies();
     this.cleanupBullets();
     this.checkWaveProgress();
+    this.checkEnemyThreshold();
   }
 
   // ─── Public API ───────────────────────────────────────────
@@ -165,6 +210,72 @@ export class GameScene extends Phaser.Scene {
       return { ok: false, message: `${def.name} not owned — purchase it first` };
     }
     return { ok: false, message: `Equip failed: ${result.reason}` };
+  }
+
+  // ─── Lifecycle controls ───────────────────────────────────────────────────
+
+  pauseGame(): { ok: boolean; message: string } {
+    if (this._paused || this.gameOverShown) {
+      return { ok: false, message: this._paused ? 'Game is already paused' : 'Game is over' };
+    }
+    this._paused = true;
+    this.physics.pause();
+    this.time.paused = true; // pause wave spawn timers and all scene time events
+    this.pauseOverlay = this.add.text(400, 300, 'PAUSED', {
+      fontSize: '64px', color: '#00e5ff', fontFamily: 'Arial', fontStyle: 'bold',
+      stroke: '#000000', strokeThickness: 4,
+    }).setOrigin(0.5).setDepth(10).setAlpha(0);
+    this.tweens.add({ targets: this.pauseOverlay, alpha: 1, duration: 250 });
+    this.events.emit('gamePaused');
+    return { ok: true, message: 'Game paused' };
+  }
+
+  resumeGame(): { ok: boolean; message: string } {
+    if (!this._paused) {
+      return { ok: false, message: 'Game is not paused' };
+    }
+    this._paused = false;
+    this.physics.resume();
+    this.time.paused = false; // resume wave spawn timers
+    if (this.pauseOverlay) {
+      const overlay = this.pauseOverlay;
+      this.pauseOverlay = null;
+      this.tweens.add({
+        targets: overlay, alpha: 0, duration: 200,
+        onComplete: () => { if (overlay.active) overlay.destroy(); },
+      });
+    }
+    this.events.emit('gameResumed');
+    return { ok: true, message: 'Game resumed' };
+  }
+
+  /**
+   * Emit gameRestart event — main.ts handles full restart sequence
+   * (voice disconnect → scene.restart → reconnect).
+   * Returns immediately so the voice tool can acknowledge before restart begins.
+   */
+  requestRestart(): { ok: boolean; message: string } {
+    if (this.gameOverShown) {
+      // Allow restart from game-over screen
+    }
+    this.time.delayedCall(600, () => { this.events.emit('gameRestart'); });
+    return { ok: true, message: 'Restarting game…' };
+  }
+
+  /**
+   * Emit gameStop event — main.ts handles voice disconnect + return to start screen.
+   */
+  requestStop(): { ok: boolean; message: string } {
+    this.time.delayedCall(600, () => { this.events.emit('gameStop'); });
+    return { ok: true, message: 'Stopping game…' };
+  }
+
+  /**
+   * Trigger highlight animations on ShopHUDScene for specific weapons.
+   * Called by main.ts when the voice backend sends a 'highlight' SSE notification.
+   */
+  highlightWeapons(weaponIds: string[], area: 'arsenal' | 'armory'): void {
+    this.events.emit('weaponHighlight', weaponIds, area);
   }
 
   /**
@@ -356,6 +467,13 @@ export class GameScene extends Phaser.Scene {
     kb.on('keydown-ONE',   () => this.equipWeapon('pistol'));
     kb.on('keydown-TWO',   () => this.equipWeapon('shotgun'));
     kb.on('keydown-THREE', () => this.equipWeapon('laser'));
+    // Enter/Return to shoot (fires in current aim direction)
+    this.enterKey = kb.addKey(Phaser.Input.Keyboard.KeyCodes.ENTER);
+
+    // J/K — cycle equipped weapon through owned inventory
+    this.jKey = kb.addKey(Phaser.Input.Keyboard.KeyCodes.J);
+    this.kKey = kb.addKey(Phaser.Input.Keyboard.KeyCodes.K);
+
     // Shop toggle
     kb.on('keydown-B', () => {
       if (this.scene.isActive('ShopScene')) {
@@ -418,19 +536,12 @@ export class GameScene extends Phaser.Scene {
   }
 
   private handleAiming(): void {
-    const ptr = this.input.activePointer;
-    // worldX/Y accounts for any camera transform; ptr.x/y are in CSS canvas pixels.
-    const angle = Phaser.Math.Angle.Between(
-      this.player.x, this.player.y, ptr.worldX, ptr.worldY,
-    );
-    this.player.setRotation(angle);
+    // aimAngle is kept up-to-date by updateAimAngle() every frame
+    this.player.setRotation(this.aimAngle);
   }
 
   private fireWeapon(time: number): void {
-    const ptr = this.input.activePointer;
-    const angle = Phaser.Math.Angle.Between(
-      this.player.x, this.player.y, ptr.worldX, ptr.worldY,
-    );
+    const angle = this.aimAngle;
 
     // Offset bullet origin to the ship's nose tip (18 px ahead in aim direction)
     const muzzleX = this.player.x + Math.cos(angle) * 18;
@@ -486,6 +597,56 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  /**
+   * Update the unified aim angle each frame.
+   *
+   * Priority (high → low):
+   * 1. Mouse moved this frame → switch to mouse mode (compute from pointer)
+   * 2. J or K is held → keyboard mode: rotate aimAngle by AIM_ROTATION_SPEED * dt
+   * 3. No key held, mouse mode → recompute angle from current pointer position
+   *
+   * J = anticlockwise (decreasing radians), K = clockwise (increasing radians).
+   */
+  private updateAimAngle(delta: number): void {
+    const ptr = this.input.activePointer;
+    const mx = ptr.worldX;
+    const my = ptr.worldY;
+
+    // Mouse movement takes priority — exits keyboard mode immediately
+    if (mx !== this.lastMouseX || my !== this.lastMouseY) {
+      this.lastMouseX = mx;
+      this.lastMouseY = my;
+      this.keyboardAimActive = false;
+    }
+
+    if (this.jKey.isDown || this.kKey.isDown) {
+      this.keyboardAimActive = true;
+      const rotDelta = this.AIM_ROTATION_SPEED * (delta / 1000);
+      if (this.jKey.isDown) this.aimAngle -= rotDelta; // anticlockwise
+      if (this.kKey.isDown) this.aimAngle += rotDelta; // clockwise
+    } else if (!this.keyboardAimActive) {
+      // Mouse mode: derive angle from pointer each frame
+      this.aimAngle = Phaser.Math.Angle.Between(
+        this.player.x, this.player.y, mx, my,
+      );
+    }
+    // Keyboard mode with no key held: keep current aimAngle until mouse moves
+  }
+
+  /**
+   * Emit 'enemyThreshold' once when enemy count crosses from <5 to ≥5.
+   * Resets when count falls below threshold so it can fire again next wave.
+   */
+  private checkEnemyThreshold(): void {
+    const count = this.enemies.getLength();
+    if (count >= 5 && !this._enemyThresholdReached) {
+      this._enemyThresholdReached = true;
+      this.events.emit('enemyThreshold', count);
+    } else if (count < 5) {
+      this._enemyThresholdReached = false;
+    }
+  }
+
   private initCommerce(): void {
     const catalog = WEAPON_CATALOGUE.map(def => ({
       id: def.id,
@@ -533,16 +694,39 @@ export class GameScene extends Phaser.Scene {
   private showGameOver(): void {
     if (this.gameOverShown) return;
     this.gameOverShown = true;
+    this._paused = true; // freeze update loop
+    this.physics.pause();
+
     this.enemies.getChildren().forEach(c => {
       const body = (c as Phaser.Physics.Arcade.Sprite).body as Phaser.Physics.Arcade.Body | null;
       body?.setVelocity(0, 0);
     });
-    this.add.text(400, 260, 'GAME OVER', {
-      fontSize: '64px', color: '#ff4444', fontFamily: 'Arial',
+
+    this.add.text(400, 240, 'GAME OVER', {
+      fontSize: '64px', color: '#ff4444', fontFamily: 'Arial', fontStyle: 'bold',
+      stroke: '#000', strokeThickness: 4,
     }).setOrigin(0.5).setDepth(10);
-    this.add.text(400, 340, 'Refresh to play again', {
-      fontSize: '22px', color: '#888888', fontFamily: 'Arial',
-    }).setOrigin(0.5).setDepth(10);
+
+    // Restart button
+    const restartBtn = this.add.text(285, 330, '  RESTART  ', {
+      fontSize: '22px', color: '#00e5ff', fontFamily: 'Arial', fontStyle: 'bold',
+      backgroundColor: '#001a2e', padding: { x: 14, y: 8 },
+      stroke: '#00aaff', strokeThickness: 1,
+    }).setOrigin(0.5).setDepth(10).setInteractive({ useHandCursor: true });
+    restartBtn.on('pointerover', () => restartBtn.setColor('#ffffff'));
+    restartBtn.on('pointerout',  () => restartBtn.setColor('#00e5ff'));
+    restartBtn.on('pointerdown', () => { this.events.emit('gameRestart'); });
+
+    // Back to Start button
+    const stopBtn = this.add.text(515, 330, '  BACK TO START  ', {
+      fontSize: '22px', color: '#ff8800', fontFamily: 'Arial', fontStyle: 'bold',
+      backgroundColor: '#1a0a00', padding: { x: 14, y: 8 },
+      stroke: '#ff5500', strokeThickness: 1,
+    }).setOrigin(0.5).setDepth(10).setInteractive({ useHandCursor: true });
+    stopBtn.on('pointerover', () => stopBtn.setColor('#ffffff'));
+    stopBtn.on('pointerout',  () => stopBtn.setColor('#ff8800'));
+    stopBtn.on('pointerdown', () => { this.events.emit('gameStop'); });
+
     // Signal voice layer to stop synchronising state — the session is over.
     this.events.emit('gameOver');
   }

@@ -3,8 +3,6 @@ import Phaser from 'phaser';
 export class UIScene extends Phaser.Scene {
   private healthBar!: Phaser.GameObjects.Graphics;
   private waveText!: Phaser.GameObjects.Text;
-  private weaponText!: Phaser.GameObjects.Text;
-  private balanceText!: Phaser.GameObjects.Text;
 
   constructor() {
     super({ key: 'UIScene' });
@@ -26,15 +24,6 @@ export class UIScene extends Phaser.Scene {
       .text(400, 14, 'Wave 1', { fontSize: '20px', color: '#00e5ff', fontFamily: 'Arial' })
       .setOrigin(0.5, 0);
 
-    // ── Weapon + balance (top right) ─────────────────────────
-    this.weaponText = this.add
-      .text(784, 14, 'Pistol', { fontSize: '16px', color: '#ffff00', fontFamily: 'Arial' })
-      .setOrigin(1, 0);
-
-    this.balanceText = this.add
-      .text(784, 36, '1,000 coins', { fontSize: '13px', color: '#ffd700', fontFamily: 'Arial' })
-      .setOrigin(1, 0);
-
     // ── Controls hint (bottom centre) ───────────────────────
     this.add.text(400, 589, 'WASD move  •  Mouse aim/fire  •  1/2/3 equip  •  B shop', {
       fontSize: '11px', color: '#334455', fontFamily: 'Arial',
@@ -49,14 +38,6 @@ export class UIScene extends Phaser.Scene {
 
     gs.events.on('waveChanged', (wave: number) => {
       this.waveText.setText(`Wave ${wave}`);
-    });
-
-    gs.events.on('weaponChanged', (name: string) => {
-      this.weaponText.setText(name);
-    });
-
-    gs.events.on('walletChanged', (balance: number) => {
-      this.balanceText.setText(`${balance.toLocaleString()} coins`);
     });
 
     gs.events.on('notification', (text: string, color: string) => {

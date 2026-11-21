@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 
-export type CommandAction = 'purchase' | 'equip';
+export type CommandAction = 'purchase' | 'equip' | 'pause' | 'resume' | 'restart' | 'stop';
 
 export interface VoiceCommand {
   id: string;        // used as CommerceEngine idempotency key (= tool_call_id when available)
   action: CommandAction;
-  weaponId: string;
+  weaponId?: string;
 }
 
 export interface CommandResult {
@@ -72,14 +72,29 @@ export class CommandBus {
     return this.pending.size;
   }
 
+  /**
+   * Send a named SSE event to a channel's stream (fire-and-forget).
+   * Sends `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`.
+   * No-ops silently if no stream is registered or the stream has ended.
+   */
+  notify(channel: string, eventName: string, data: unknown): void {
+    const stream = this.streams.get(channel);
+    if (!stream || stream.writableEnded) return;
+    try {
+      stream.write(`event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch {
+      // Stream may have closed between the check and the write — ignore silently.
+    }
+  }
+
   // ─── Command dispatch ─────────────────────────────────────────────────────
 
   /**
    * Dispatch a command to the browser.
    *
-   * @param channel  - Session channel (must have an active SSE stream).
-   * @param action   - 'purchase' | 'equip'
-   * @param weaponId - Weapon catalogue ID.
+   * @param channel   - Session channel (must have an active SSE stream).
+   * @param action    - 'purchase' | 'equip' | 'pause' | 'resume' | 'restart' | 'stop'
+   * @param weaponId  - Weapon catalogue ID. Leave empty string for lifecycle commands.
    * @param commandId - Stable ID for this invocation (use Agora's tool_call_id
    *   when available so CommerceEngine idempotency survives Agora retries).
    *   Falls back to a fresh UUID.
@@ -87,7 +102,7 @@ export class CommandBus {
   async dispatch(
     channel: string,
     action: CommandAction,
-    weaponId: string,
+    weaponId: string = '',
     commandId: string = randomUUID(),
   ): Promise<CommandResult> {
     const stream = this.streams.get(channel);
@@ -116,7 +131,7 @@ export class CommandBus {
     action: CommandAction,
     weaponId: string,
   ): Promise<CommandResult> {
-    const cmd: VoiceCommand = { id: commandId, action, weaponId };
+    const cmd: VoiceCommand = weaponId ? { id: commandId, action, weaponId } : { id: commandId, action };
 
     return new Promise<CommandResult>((resolve) => {
       const timeoutHandle = setTimeout(() => {

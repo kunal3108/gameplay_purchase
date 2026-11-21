@@ -7,11 +7,28 @@
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
       body { background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; }
+      #layout { display: flex; align-items: stretch; }
+      #sidebar {
+        width: 172px;
+        display: none;
+        background: rgba(2,4,16,0.95);
+        border-right: 1px solid #003366;
+        color: #8899aa;
+        font-family: monospace;
+        font-size: 10px;
+        line-height: 1.6;
+        padding: 8px 10px;
+        user-select: none;
+        pointer-events: none;
+      }
       #game-container { position: relative; display: inline-block; }
     </style>
   </head>
   <body>
-    <div id="game-container"></div>
+    <div id="layout">
+      <div id="sidebar"></div>
+      <div id="game-container"></div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

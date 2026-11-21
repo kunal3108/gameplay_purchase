@@ -85,8 +85,8 @@ describe('buildTools', () => {
   const SECRET = 'test-secret-abc123';
   const BASE = 'https://example.com';
 
-  it('returns four tools', () => {
-    expect(buildTools(BASE, SECRET)).toHaveLength(4);
+  it('returns eight tools', () => {
+    expect(buildTools(BASE, SECRET)).toHaveLength(8);
   });
 
   it('tool names are correct', () => {
@@ -95,6 +95,10 @@ describe('buildTools', () => {
     expect(tools[1]!.function.name).toBe('get_player_status');
     expect(tools[2]!.function.name).toBe('purchase_weapon');
     expect(tools[3]!.function.name).toBe('equip_weapon');
+    expect(tools[4]!.function.name).toBe('pause_game');
+    expect(tools[5]!.function.name).toBe('resume_game');
+    expect(tools[6]!.function.name).toBe('restart_game');
+    expect(tools[7]!.function.name).toBe('stop_game');
   });
 
   it('GET tool URLs contain base URL, channel template, and no secret', () => {
@@ -108,11 +112,14 @@ describe('buildTools', () => {
     }
   });
 
-  it('POST tools have correct body with channel, weapon_id and tool_call_id', () => {
+  it('POST tools have correct body with channel, weapon_id and tool_call_id (weapon tools)', () => {
     const tools = buildTools(BASE, SECRET);
-    const postTools = tools.filter(t => t.server.method === 'POST');
-    expect(postTools).toHaveLength(2);
-    for (const t of postTools) {
+    const weaponPostTools = tools.filter(
+      t => t.server.method === 'POST' &&
+           (t.function.name === 'purchase_weapon' || t.function.name === 'equip_weapon'),
+    );
+    expect(weaponPostTools).toHaveLength(2);
+    for (const t of weaponPostTools) {
       const body = t.server.body as Record<string, string>;
       expect(body['tool_call_id']).toBe('{{tool_call_id}}');
       expect(body['channel']).toBe('{{template_variables.channel}}');
@@ -159,6 +166,68 @@ describe('buildTools', () => {
   it('all tools have timeout within Agora allowed range (1000–100000ms)', () => {
     for (const t of buildTools(BASE, SECRET)) {
       const ms = t.server.timeout_ms as number;
+      expect(ms).toBeGreaterThanOrEqual(1000);
+      expect(ms).toBeLessThanOrEqual(100_000);
+    }
+  });
+
+  // ── Lifecycle tool tests ───────────────────────────────────────────────────
+
+  it('lifecycle tools are POST methods', () => {
+    const lifecycleNames = ['pause_game', 'resume_game', 'restart_game', 'stop_game'];
+    const tools = buildTools(BASE, SECRET);
+    for (const name of lifecycleNames) {
+      const tool = tools.find(t => t.function.name === name)!;
+      expect(tool).toBeDefined();
+      expect(tool.server.method).toBe('POST');
+    }
+  });
+
+  it('lifecycle tools do NOT have weapon_id in the body', () => {
+    const lifecycleNames = ['pause_game', 'resume_game', 'restart_game', 'stop_game'];
+    const tools = buildTools(BASE, SECRET);
+    for (const name of lifecycleNames) {
+      const tool = tools.find(t => t.function.name === name)!;
+      const body = tool.server.body as Record<string, string>;
+      expect(body['weapon_id']).toBeUndefined();
+    }
+  });
+
+  it('lifecycle tools DO have tool_call_id and channel in the body', () => {
+    const lifecycleNames = ['pause_game', 'resume_game', 'restart_game', 'stop_game'];
+    const tools = buildTools(BASE, SECRET);
+    for (const name of lifecycleNames) {
+      const tool = tools.find(t => t.function.name === name)!;
+      const body = tool.server.body as Record<string, string>;
+      expect(body['tool_call_id']).toBe('{{tool_call_id}}');
+      expect(body['channel']).toBe('{{template_variables.channel}}');
+    }
+  });
+
+  it('lifecycle tools use Bearer auth', () => {
+    const lifecycleNames = ['pause_game', 'resume_game', 'restart_game', 'stop_game'];
+    const tools = buildTools(BASE, SECRET);
+    for (const name of lifecycleNames) {
+      const tool = tools.find(t => t.function.name === name)!;
+      expect(tool.server.headers?.['Authorization']).toBe(`Bearer ${SECRET}`);
+    }
+  });
+
+  it('lifecycle tools use sync execution mode', () => {
+    const lifecycleNames = ['pause_game', 'resume_game', 'restart_game', 'stop_game'];
+    const tools = buildTools(BASE, SECRET);
+    for (const name of lifecycleNames) {
+      const tool = tools.find(t => t.function.name === name)!;
+      expect(tool.execution?.mode).toBe('sync');
+    }
+  });
+
+  it('lifecycle tools have timeout within allowed range', () => {
+    const lifecycleNames = ['pause_game', 'resume_game', 'restart_game', 'stop_game'];
+    const tools = buildTools(BASE, SECRET);
+    for (const name of lifecycleNames) {
+      const tool = tools.find(t => t.function.name === name)!;
+      const ms = tool.server.timeout_ms as number;
       expect(ms).toBeGreaterThanOrEqual(1000);
       expect(ms).toBeLessThanOrEqual(100_000);
     }

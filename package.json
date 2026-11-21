@@ -7,7 +7,7 @@
     "dev:server": "cd examples/voicestrike/server && node --loader ts-node/esm server.ts",
     "build": "npm run build --workspace=packages/core && npm run build --workspace=packages/adapter-agora && npm run build --workspace=examples/voicestrike",
     "typecheck": "npm run typecheck --workspace=packages/core && npm run typecheck --workspace=packages/adapter-agora && npm run typecheck --workspace=examples/voicestrike",
-    "test": "npm run test --workspace=packages/core && cd examples/voicestrike/server && npx vitest run"
+    "test": "npm run test --workspace=packages/core && npm run test --workspace=packages/adapter-agora && cd examples/voicestrike/server && npx vitest run"
   },
   "devDependencies": {
     "typescript": "^5.4.0"

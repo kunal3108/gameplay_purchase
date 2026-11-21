@@ -33,6 +33,8 @@ export interface AgoraVoiceCallbacks {
   onStateChange?: (state: VoiceState) => void;
   onTranscript?: (entry: TranscriptEntry) => void;
   onError?: (message: string) => void;
+  /** Fired when the backend sends a highlight notification for the shop HUD. */
+  onHighlight?: (weaponIds: string[], area: 'arsenal' | 'armory') => void;
 }
 
 /**
@@ -49,16 +51,17 @@ export interface GameStateSnapshot {
 }
 
 /** Actions the backend can send to the browser for execution. */
-export type VoiceCommandAction = 'purchase' | 'equip';
+export type VoiceCommandAction = 'purchase' | 'equip' | 'pause' | 'resume' | 'restart' | 'stop';
 
 /**
  * A command pushed from the backend to the browser via SSE.
  * The `id` matches Agora's tool_call_id, used as a CommerceEngine idempotency key.
+ * `weaponId` is present for purchase/equip; absent for lifecycle commands.
  */
 export interface VoiceCommand {
   id: string;
   action: VoiceCommandAction;
-  weaponId: string;
+  weaponId?: string;
 }
 
 /** Result sent back from the browser after executing a VoiceCommand. */

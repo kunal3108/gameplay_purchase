@@ -10,6 +10,7 @@ import { commandBus } from './commandBus.js';
 import type { CommandResult } from './commandBus.js';
 import { buildTools, buildListWeaponsResponse, buildPlayerStatusResponse } from './gameTools.js';
 import type { GameStateSnapshot } from './sessionStore.js';
+import { WEAPON_CATALOGUE } from './weaponCatalogue.js';
 
 const VALID_WEAPON_IDS = ['pistol', 'shotgun', 'laser'] as const;
 type WeaponId = typeof VALID_WEAPON_IDS[number];
@@ -32,6 +33,10 @@ if (!TOOL_SECRET) {
 // Each channel gets a unique token at token-generation time.
 // The browser must include it as X-Write-Token on every /api/session-state POST.
 const writeTokenStore = new Map<string, string>();
+
+// ─── Agent ID store: maps channel → running agentId ──────────────────────────
+// Populated after /api/invite-agent succeeds; used by /api/agent-speak.
+const agentIdStore = new Map<string, string>();
 
 // Accept both JSON and plain-text bodies (sendBeacon sends text/plain)
 app.use(cors());
@@ -64,15 +69,16 @@ function requireEnv(name: string): string {
   return value;
 }
 
-// ─── Striker persona ──────────────────────────────────────────────────────────
+// ─── Jarvis persona ──────────────────────────────────────────────────────────
 
-const STRIKER_PROMPT = `You are **Striker**, a tactical AI co-pilot embedded in VoiceStrike — a top-down space shooter.
+const STRIKER_PROMPT = `You are **Jarvis**, a tactical AI co-pilot embedded in VoiceStrike — a top-down space shooter.
 
 # Your Role
 You are the player's voice-controlled mission control. You can:
 - Report live game stats
 - Purchase weapons for the player
 - Switch the player's equipped weapon
+- Control game flow (pause, resume, restart, stop)
 - Give tactical tips
 
 # Tools — call before answering or acting
@@ -84,6 +90,12 @@ You are the player's voice-controlled mission control. You can:
 **Action (require explicit player intent):**
 - **purchase_weapon(weapon_id)** — call when the player clearly asks to buy a weapon. Always call list_available_weapons first to confirm they can afford it and don't already own it. If the player names an ambiguous weapon (e.g. "the gun"), ask which one before calling.
 - **equip_weapon(weapon_id)** — call when the player asks to switch or equip a weapon they own.
+
+**Lifecycle (require explicit player intent):**
+- **pause_game** — pauses enemy movement and all gameplay timers; voice stays active so the player can keep talking.
+- **resume_game** — resumes from the exact paused state; enemies, timers, and scoring pick up where they left off.
+- **restart_game** — ends the current session and starts a fresh one; score, health, and wave reset to defaults.
+- **stop_game** — ends gameplay entirely and returns the player to the start screen.
 
 # Result handling — strict rules
 - **Never confirm success before the tool returns ok:true.** If the tool returns ok:false, relay the actual reason. Example responses:
@@ -103,7 +115,7 @@ You are the player's voice-controlled mission control. You can:
 - Ask at most one clarifying question per turn.
 - Weapon IDs for tools: pistol, shotgun, laser (all lowercase).`;
 
-const STRIKER_GREETING = `Striker online. Ready to roll, Pilot?`;
+const STRIKER_GREETING = `Welcome to VoiceStrike, Pilot! I'm Jarvis, your AI shopping assistant. I'll help you choose and buy weapons while you fight. Ready? Let's go!`;
 
 const AGENT_UID = '123456';
 const EXPIRATION_SECONDS = 3600;
@@ -202,6 +214,13 @@ app.get('/api/tools/list_available_weapons', (req, res) => {
     res.status(404).json({ error: 'Session not found or expired. Game state not yet available.' });
     return;
   }
+
+  // Notify the browser to highlight purchasable weapons in the armory panel
+  const purchasableIds = WEAPON_CATALOGUE
+    .filter(w => !state.ownedWeapons.includes(w.id))
+    .map(w => w.id);
+  commandBus.notify(channel, 'highlight', { weaponIds: purchasableIds, area: 'armory' });
+
   res.json(buildListWeaponsResponse(state));
 });
 
@@ -217,6 +236,10 @@ app.get('/api/tools/get_player_status', (req, res) => {
     res.status(404).json({ error: 'Session not found or expired. Game state not yet available.' });
     return;
   }
+
+  // Notify the browser to highlight the player's owned weapons in the arsenal panel
+  commandBus.notify(channel, 'highlight', { weaponIds: state.ownedWeapons, area: 'arsenal' });
+
   res.json(buildPlayerStatusResponse(state));
 });
 
@@ -347,6 +370,104 @@ app.post('/api/tools/equip_weapon', async (req, res) => {
   }
 });
 
+// ─── Lifecycle tool endpoints (called by Agora cloud) ────────────────────────
+
+app.post('/api/tools/pause_game', async (req, res) => {
+  if (!requireToolAuth(req, res)) return;
+
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { channel, tool_call_id } = body as { channel?: string; tool_call_id?: string };
+
+    if (!channel) {
+      res.json({ ok: false, message: 'channel is required' });
+      return;
+    }
+    if (!commandBus.hasStream(channel)) {
+      res.json({ ok: false, message: 'No active game session for this channel' });
+      return;
+    }
+
+    const commandId = tool_call_id ?? randomUUID();
+    const result = await commandBus.dispatch(channel, 'pause', '', commandId);
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, message: `Pause error: ${err instanceof Error ? err.message : String(err)}` });
+  }
+});
+
+app.post('/api/tools/resume_game', async (req, res) => {
+  if (!requireToolAuth(req, res)) return;
+
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { channel, tool_call_id } = body as { channel?: string; tool_call_id?: string };
+
+    if (!channel) {
+      res.json({ ok: false, message: 'channel is required' });
+      return;
+    }
+    if (!commandBus.hasStream(channel)) {
+      res.json({ ok: false, message: 'No active game session for this channel' });
+      return;
+    }
+
+    const commandId = tool_call_id ?? randomUUID();
+    const result = await commandBus.dispatch(channel, 'resume', '', commandId);
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, message: `Resume error: ${err instanceof Error ? err.message : String(err)}` });
+  }
+});
+
+app.post('/api/tools/restart_game', async (req, res) => {
+  if (!requireToolAuth(req, res)) return;
+
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { channel, tool_call_id } = body as { channel?: string; tool_call_id?: string };
+
+    if (!channel) {
+      res.json({ ok: false, message: 'channel is required' });
+      return;
+    }
+    if (!commandBus.hasStream(channel)) {
+      res.json({ ok: false, message: 'No active game session for this channel' });
+      return;
+    }
+
+    const commandId = tool_call_id ?? randomUUID();
+    const result = await commandBus.dispatch(channel, 'restart', '', commandId);
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, message: `Restart error: ${err instanceof Error ? err.message : String(err)}` });
+  }
+});
+
+app.post('/api/tools/stop_game', async (req, res) => {
+  if (!requireToolAuth(req, res)) return;
+
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const { channel, tool_call_id } = body as { channel?: string; tool_call_id?: string };
+
+    if (!channel) {
+      res.json({ ok: false, message: 'channel is required' });
+      return;
+    }
+    if (!commandBus.hasStream(channel)) {
+      res.json({ ok: false, message: 'No active game session for this channel' });
+      return;
+    }
+
+    const commandId = tool_call_id ?? randomUUID();
+    const result = await commandBus.dispatch(channel, 'stop', '', commandId);
+    res.json(result);
+  } catch (err) {
+    res.json({ ok: false, message: `Stop error: ${err instanceof Error ? err.message : String(err)}` });
+  }
+});
+
 // ─── Agent invite endpoint ────────────────────────────────────────────────────
 
 app.post('/api/invite-agent', async (req, res) => {
@@ -436,6 +557,9 @@ app.post('/api/invite-agent', async (req, res) => {
 
     const agentId = await session.start();
 
+    // Store agentId for proactive speak calls from the browser
+    agentIdStore.set(channel_name, agentId);
+
     res.json({ agent_id: agentId, create_ts: Math.floor(Date.now() / 1000), state: 'RUNNING' });
   } catch (err) {
     console.error('Invite agent error:', err);
@@ -460,6 +584,7 @@ app.post('/api/stop-conversation', async (req, res) => {
     if (channel) {
       sessionStore.delete(channel);
       writeTokenStore.delete(channel);
+      agentIdStore.delete(channel);
     }
 
     const appId = requireEnv('AGORA_APP_ID');
@@ -486,6 +611,61 @@ app.post('/api/stop-conversation', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('Stop conversation error:', err);
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ─── Proactive agent speak (browser → triggers Jarvis TTS) ───────────────────
+// Browser calls this when it wants Jarvis to deliver a proactive message
+// (e.g. shotgun recommendation when 5+ enemies appear).
+// Auth: same write-token as session-state to prevent external abuse.
+
+app.post('/api/agent-speak', async (req, res) => {
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const {
+      channel,
+      text,
+      priority = 'APPEND',
+      interruptable = true,
+    } = body as {
+      channel?: string;
+      text?: string;
+      priority?: string;
+      interruptable?: boolean;
+    };
+
+    if (!channel || !text) {
+      res.status(400).json({ error: 'channel and text are required' });
+      return;
+    }
+    if (typeof text !== 'string' || text.length > 512) {
+      res.status(400).json({ error: 'text must be a string ≤ 512 bytes' });
+      return;
+    }
+
+    // Validate write token
+    const providedToken = req.headers['x-write-token'];
+    const expectedToken = writeTokenStore.get(channel);
+    if (!providedToken || !expectedToken || providedToken !== expectedToken) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const agentId = agentIdStore.get(channel);
+    if (!agentId) {
+      res.json({ ok: false, message: 'No active agent for this channel' });
+      return;
+    }
+
+    const appId = requireEnv('AGORA_APP_ID');
+    const appCertificate = requireEnv('AGORA_APP_CERTIFICATE');
+    const client = new AgoraClient({ area: Area.US, appId, appCertificate });
+
+    await client.agents.speak({ appid: appId, agentId, text, priority: priority as 'INTERRUPT' | 'APPEND' | 'IGNORE', interruptable });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Agent speak error:', err);
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });

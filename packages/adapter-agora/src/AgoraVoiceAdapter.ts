@@ -20,6 +20,7 @@ import {
   type VoiceCommandResult,
   type VoiceState,
 } from './types.js';
+import { agentReadyErrorMessage } from './agentReadinessLogic.js';
 
 export class AgoraVoiceAdapter implements VoiceProviderAdapter {
   private readonly appId: string;
@@ -47,6 +48,14 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
 
   // Mic mute state
   private micMuted = false;
+
+  // Agent audio readiness — resolved when agent publishes into RTC channel
+  private _agentPublished = false;
+  private _agentPublishedCbs: Array<() => void> = [];
+  private _agentReadyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // One-shot flag: true once the first agent transcript arrives (confirms greeting pipeline)
+  private _greetingLogged = false;
 
   // Write token for authorised session-state pushes and command-stream auth
   private writeToken: string | null = null;
@@ -104,8 +113,13 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
     if (this.state !== 'idle' && this.state !== 'error') return;
     this.setState('connecting');
 
+    // Reset agent-ready tracking for this connection attempt
+    this._agentPublished = false;
+    this._agentPublishedCbs = [];
+
     try {
       // 1. Fetch token + channel from backend
+      console.log('[VoiceAdapter:connect] Fetching token...');
       const channelParam = preferredChannel ? `&channel=${encodeURIComponent(preferredChannel)}` : '';
       const tokenRes = await fetch(`${this.serverUrl}/api/generate-agora-token?uid=0${channelParam}`);
       if (!tokenRes.ok) throw new Error(`Token fetch failed: ${tokenRes.status}`);
@@ -113,14 +127,17 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
       this.uid = uid;
       this.channel = channel;
       this.writeToken = writeToken ?? null;
+      console.log(`[VoiceAdapter:connect] Token received. Channel: ${channel}, UID: ${uid}`);
 
       // 1b. Open command SSE stream so the backend can push purchase/equip commands.
       this.openCommandStream();
 
       // 2. Create microphone track — catch permission denial
+      console.log('[VoiceAdapter:connect] Creating microphone track...');
       try {
         this.micTrack = await AgoraRTC.createMicrophoneAudioTrack();
         if (this.micMuted) await this.micTrack.setEnabled(false);
+        console.log('[VoiceAdapter:connect] Microphone track created ✓');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.toLowerCase().includes('permission')) {
@@ -134,39 +151,78 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
 
       // 3. Create and configure RTC client
       this.rtcClient = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
-      AgoraRTC.setLogLevel(4); // suppress verbose logs
+      AgoraRTC.setLogLevel(4); // suppress verbose SDK logs
 
-      // Auto-play agent audio when it arrives
+      // Handle browser autoplay restrictions
+      (AgoraRTC as unknown as { onAudioAutoplayFailed?: () => void }).onAudioAutoplayFailed = () => {
+        console.warn('[VoiceAdapter:audio] Autoplay blocked — user must click game area to enable audio');
+        this.callbacks.onError?.('Click the game area to enable Jarvis audio');
+      };
+
+      // Subscribe to agent audio when published, and detect when Jarvis joins
       this.rtcClient.on('user-published', async (user, mediaType) => {
-        if (mediaType === 'audio') {
-          await this.rtcClient!.subscribe(user, 'audio');
-          user.audioTrack?.play();
+        if (mediaType !== 'audio') return;
+        console.log(`[VoiceAdapter:rtc] user-published uid=${String(user.uid)}`);
+
+        await this.rtcClient!.subscribe(user, 'audio');
+        const track = user.audioTrack;
+        if (track) {
+          track.play();
+          console.log(`[VoiceAdapter:rtc] Playing audio from uid=${String(user.uid)} ✓`);
+        }
+
+        // Detect when Jarvis (agent) joins the RTC channel
+        if (String(user.uid) === AGENT_UID) {
+          console.log('[VoiceAdapter:connect] Jarvis audio published — agent is in channel ✓');
+          this._agentPublished = true;
+          const cbs = this._agentPublishedCbs.splice(0);
+          cbs.forEach(cb => cb());
+        }
+      });
+
+      this.rtcClient.on('user-unpublished', (user, mediaType) => {
+        if (mediaType === 'audio' && String(user.uid) === AGENT_UID) {
+          console.log('[VoiceAdapter:rtc] Jarvis audio unpublished');
         }
       });
 
       // 4. Join RTC channel
+      console.log('[VoiceAdapter:connect] Joining RTC channel...');
       await this.rtcClient.join(this.appId, channel, token, parseInt(uid, 10) || null);
+      console.log('[VoiceAdapter:connect] Joined RTC ✓');
 
       // 5. Publish microphone
       await this.rtcClient.publish(this.micTrack);
+      console.log('[VoiceAdapter:connect] Published microphone ✓');
 
       // 6. Create and login RTM client (same token covers RTC+RTM)
+      console.log('[VoiceAdapter:connect] Logging into RTM...');
       this.rtmClient = new AgoraRTM.RTM(this.appId, uid);
       await this.rtmClient.login({ token });
       await this.rtmClient.subscribe(channel);
+      console.log('[VoiceAdapter:connect] RTM subscribed ✓');
 
       // 7. Init AgoraVoiceAI toolkit
+      console.log('[VoiceAdapter:connect] Initialising AgoraVoiceAI...');
       this.voiceAI = await AgoraVoiceAI.init({
         rtcEngine: this.rtcClient as never,
         rtmEngine: this.rtmClient as never,
         renderMode: TranscriptHelperMode.TEXT,
       });
+      console.log('[VoiceAdapter:connect] AgoraVoiceAI ready ✓');
 
       // Wire transcript events
       this.voiceAI.on(AgoraVoiceAIEvents.TRANSCRIPT_UPDATED, (items) => {
         for (const item of items) {
           const isAgent = item.uid === AGENT_UID;
           const isFinal = item.status === TurnStatus.END;
+
+          // One-shot: confirm greeting arrived via Murf Falcon → RTC → browser
+          if (isAgent && !this._greetingLogged) {
+            this._greetingLogged = true;
+            console.log('[VoiceAdapter:greeting] Jarvis first audio transcript received ✓ (Murf Falcon pipeline confirmed)');
+          }
+
           const entry: TranscriptEntry = {
             id: `${item.uid}-${item.turn_id}-${item.stream_id}`,
             speaker: isAgent ? 'agent' : 'user',
@@ -174,6 +230,7 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
             isFinal,
             timestamp: item._time,
           };
+          console.log(`[VoiceAdapter:transcript] ${isAgent ? 'Jarvis' : 'Player'}: "${item.text}" (final=${isFinal})`);
           this.callbacks.onTranscript?.(entry);
           if (!isAgent && isFinal && this.speechCallback) {
             this.speechCallback(item.text);
@@ -183,9 +240,11 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
 
       // Wire agent state → voice state
       this.voiceAI.on(AgoraVoiceAIEvents.AGENT_LISTENING_CHANGED, (_, isListening) => {
+        console.log(`[VoiceAdapter:state] Agent listening: ${isListening}`);
         if (isListening) this.setState('listening');
       });
       this.voiceAI.on(AgoraVoiceAIEvents.AGENT_SPEAKING_CHANGED, (_, isSpeaking) => {
+        console.log(`[VoiceAdapter:state] Agent speaking: ${isSpeaking}`);
         if (isSpeaking) this.setState('speaking');
         else if (this.state === 'speaking') this.setState('connected');
       });
@@ -193,9 +252,10 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
       // Subscribe transcript delivery
       this.voiceAI.subscribeMessage(channel);
 
-      this.setState('connected');
-
-      // 8. Start the AI agent (non-fatal — RTC still works if this fails)
+      // 8. Invite the AI agent.
+      //    'connected' state is set ONLY after Jarvis publishes audio into the RTC channel.
+      //    If the invite fails we transition to 'error' — never to 'connected'.
+      console.log('[VoiceAdapter:connect] Inviting Jarvis agent...');
       try {
         const inviteRes = await fetch(`${this.serverUrl}/api/invite-agent`, {
           method: 'POST',
@@ -205,14 +265,66 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
         if (inviteRes.ok) {
           const { agent_id } = await inviteRes.json() as { agent_id: string };
           this.agentId = agent_id;
+          console.log('[VoiceAdapter:connect] Agent invited ✓');
         } else {
-          console.warn('[VoiceAdapter] Agent invite failed, continuing without AI:', inviteRes.status);
+          const body = await inviteRes.text().catch(() => '');
+          console.error(`[VoiceAdapter:connect] Agent invite failed (${inviteRes.status}): ${body}`);
+          // agentId remains null — handled below
         }
       } catch (err) {
-        console.warn('[VoiceAdapter] Agent invite error (non-fatal):', err);
+        console.error('[VoiceAdapter:connect] Agent invite error:', err instanceof Error ? err.message : String(err));
+        // agentId remains null — handled below
       }
+
+      // 9. Decide next state.
+      //
+      //    Case A — invite failed (agentId null): Jarvis will never publish audio.
+      //    Clean up RTC/RTM resources, show error, allow retry via connect().
+      //
+      //    Case B — invite succeeded: wait for Jarvis to publish audio (user-published event).
+      //    15 s fallback: if no audio arrives, treat as timeout error (also allows retry).
+      //    Only the user-published callback transitions to 'connected'.
+      if (!this.agentId) {
+        const msg = agentReadyErrorMessage('error-invite-failed');
+        console.warn(`[VoiceAdapter:connect] ${msg}`);
+        this.callbacks.onError?.(msg);
+        await this.cleanup();
+        this.setState('error');
+        return; // connect() resolves normally; start screen hides; HUD shows error + retry
+      }
+
+      console.log('[VoiceAdapter:connect] Waiting for Jarvis to join RTC channel...');
+      this._agentReadyTimer = setTimeout(() => {
+        this._agentReadyTimer = null;
+        if (this.state === 'connecting') {
+          const msg = agentReadyErrorMessage('error-timeout');
+          console.warn(`[VoiceAdapter:connect] ${msg}`);
+          this.callbacks.onError?.(msg);
+          // Fire-and-forget cleanup (stop agent, leave RTC/RTM) then transition to error.
+          void this.cleanup().then(() => {
+            if (this.state === 'connecting') this.setState('error');
+          });
+        }
+      }, 15_000);
+
+      if (this._agentPublished) {
+        // Agent already published before we reached this check (fast Agora cloud)
+        clearTimeout(this._agentReadyTimer);
+        this._agentReadyTimer = null;
+        // Cast away TS control-flow narrowing from the entry guard at line ~109
+        if ((this.state as VoiceState) === 'connecting') this.setState('connected');
+      } else {
+        this._agentPublishedCbs.push(() => {
+          if (this._agentReadyTimer) {
+            clearTimeout(this._agentReadyTimer);
+            this._agentReadyTimer = null;
+          }
+          if (this.state === 'connecting') this.setState('connected');
+        });
+      }
+
     } catch (err) {
-      console.error('[VoiceAdapter] connect failed:', err);
+      console.error('[VoiceAdapter:connect] Fatal error:', err instanceof Error ? err.message : String(err));
       this.callbacks.onError?.(`Connection failed: ${err instanceof Error ? err.message : String(err)}`);
       this.setState('error');
       await this.cleanup();
@@ -221,15 +333,19 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
 
   async disconnect(): Promise<void> {
     if (this.state === 'idle' || this.state === 'disconnecting') return;
+    console.log(`[VoiceAdapter:disconnect] Disconnecting (was: ${this.state})`);
     this.setState('disconnecting');
     await this.cleanup();
     this.setState('idle');
+    console.log('[VoiceAdapter:disconnect] Disconnected ✓');
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
 
   private setState(next: VoiceState): void {
+    const prev = this.state;
     this.state = next;
+    console.log(`[VoiceAdapter:state] ${prev} → ${next}`);
     this.callbacks.onStateChange?.(next);
   }
 
@@ -284,6 +400,15 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
     this.uid = null;
     this.channel = null;
     this.writeToken = null;
+
+    // Reset agent-ready and greeting state
+    this._agentPublished = false;
+    this._agentPublishedCbs = [];
+    this._greetingLogged = false;
+    if (this._agentReadyTimer) {
+      clearTimeout(this._agentReadyTimer);
+      this._agentReadyTimer = null;
+    }
   }
 
   /**
@@ -313,6 +438,14 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
         .catch(() => this.postCommandResult(cmd.id, { ok: false, message: 'Command execution error' }));
     };
 
+    // Named 'highlight' events — backend fires these when discovery tools are called
+    this.commandStream.addEventListener('highlight', (event: MessageEvent) => {
+      try {
+        const data = JSON.parse(event.data as string) as { weaponIds: string[]; area: 'arsenal' | 'armory' };
+        this.callbacks.onHighlight?.(data.weaponIds, data.area);
+      } catch { /* ignore malformed */ }
+    });
+
     this.commandStream.onerror = () => {
       // EventSource handles reconnection automatically; this is just for visibility.
       console.debug('[VoiceAdapter] Command stream reconnecting...');
@@ -340,6 +473,24 @@ export class AgoraVoiceAdapter implements VoiceProviderAdapter {
       );
     }
   };
+
+  /**
+   * Ask Jarvis to proactively speak a message via the Agora TTS pipeline.
+   * Uses APPEND priority so the message is queued after any current turn.
+   * Fire-and-forget — never throws.
+   */
+  requestProactiveRecommendation(text: string): void {
+    if (!this.channel || !this.writeToken) return;
+    if (this.state === 'idle' || this.state === 'error' || this.state === 'disconnecting') return;
+    fetch(`${this.serverUrl}/api/agent-speak`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Write-Token': this.writeToken,
+      },
+      body: JSON.stringify({ channel: this.channel, text, priority: 'APPEND', interruptable: true }),
+    }).catch(() => {}); // best-effort
+  }
 
   /**
    * Push a live game state snapshot to the backend session store.

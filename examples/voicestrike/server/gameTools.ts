@@ -41,6 +41,7 @@ const weaponIdParam = {
 
 /**
  * Build the LlmTool array for the agent config.
+ * Returns 8 tools: 2 discovery (GET), 2 weapon action (POST), 4 lifecycle (POST).
  * @param toolBaseUrl - Publicly accessible base URL (required for Agora cloud to reach).
  * @param secret - TOOL_SECRET value; sent as a constant Authorization header so it
  *   never appears in access-log URLs or server-side request logs.
@@ -144,6 +145,95 @@ export function buildTools(toolBaseUrl: string, secret: string): LlmTool[] {
           tool_call_id: '{{tool_call_id}}',
           channel: '{{template_variables.channel}}',
           weapon_id: '{{args.weapon_id}}',
+        },
+        timeout_ms: 5000,
+      },
+    },
+    // ── Lifecycle tools — control game state without a weapon argument ────────
+    {
+      type: 'function',
+      function: {
+        name: 'pause_game',
+        description:
+          'Pauses enemy movement and all gameplay timers. The voice assistant stays active ' +
+          'so the player can still talk to Jarvis while paused. ' +
+          'Returns ok:true when the game is successfully paused.',
+        parameters: { type: 'object', properties: {} },
+      },
+      execution: { mode: 'sync' },
+      server: {
+        method: 'POST',
+        url: `${toolBaseUrl}/api/tools/pause_game`,
+        headers: authHeaders,
+        body: {
+          tool_call_id: '{{tool_call_id}}',
+          channel: '{{template_variables.channel}}',
+        },
+        timeout_ms: 5000,
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'resume_game',
+        description:
+          'Resumes gameplay from the exact paused state — enemies, timers, and scoring ' +
+          'all pick up where they left off. ' +
+          'Returns ok:true when the game is successfully resumed.',
+        parameters: { type: 'object', properties: {} },
+      },
+      execution: { mode: 'sync' },
+      server: {
+        method: 'POST',
+        url: `${toolBaseUrl}/api/tools/resume_game`,
+        headers: authHeaders,
+        body: {
+          tool_call_id: '{{tool_call_id}}',
+          channel: '{{template_variables.channel}}',
+        },
+        timeout_ms: 5000,
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'restart_game',
+        description:
+          'Ends the current game session and starts a completely fresh one — ' +
+          'score, health, and wave reset to defaults. ' +
+          'Returns ok:true when the restart is initiated.',
+        parameters: { type: 'object', properties: {} },
+      },
+      execution: { mode: 'sync' },
+      server: {
+        method: 'POST',
+        url: `${toolBaseUrl}/api/tools/restart_game`,
+        headers: authHeaders,
+        body: {
+          tool_call_id: '{{tool_call_id}}',
+          channel: '{{template_variables.channel}}',
+        },
+        timeout_ms: 5000,
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'stop_game',
+        description:
+          'Ends gameplay entirely and returns the player to the start screen. ' +
+          'Use this when the player wants to quit or exit the current session. ' +
+          'Returns ok:true when the game has stopped.',
+        parameters: { type: 'object', properties: {} },
+      },
+      execution: { mode: 'sync' },
+      server: {
+        method: 'POST',
+        url: `${toolBaseUrl}/api/tools/stop_game`,
+        headers: authHeaders,
+        body: {
+          tool_call_id: '{{tool_call_id}}',
+          channel: '{{template_variables.channel}}',
         },
         timeout_ms: 5000,
       },
